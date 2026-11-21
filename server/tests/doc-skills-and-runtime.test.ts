@@ -342,7 +342,7 @@ describe('Anthropic doc skills and runtime isolation', () => {
         legacyMarker: false,
       });
 
-      migrateLegacySyncedBuiltins(aliceProfile.profileDir, builtinSkillsDir);
+      migrateLegacySyncedBuiltins(aliceProfile.profileDir);
 
       expect(
         fs.existsSync(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills-disabled', 'docx')),
