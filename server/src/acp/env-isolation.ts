@@ -10,6 +10,7 @@ const require = createRequire(import.meta.url);
 
 export const SANDBOX_WORKSPACE_MOUNT = '/workspace';
 export const SANDBOX_HOME_MOUNT = '/home/sandbox';
+export const SANDBOX_DOC_RUNTIME_MOUNT = '/opt/agy-doc-runtime';
 
 export function getChatBrainHostDir(profileDir: string, workspaceDir?: string | null): string {
   const profileAbs = path.resolve(profileDir);
@@ -56,6 +57,10 @@ const ETC_WHITELIST_DIRS = [
   '/etc/ld.so.conf.d',
   '/etc/alternatives',
   '/etc/terminfo',
+  '/etc/fonts',
+  '/etc/libreoffice',
+  '/etc/ImageMagick-6',
+  '/etc/ImageMagick-7',
 ] as const;
 
 const ETC_WHITELIST_FILES = [
@@ -578,6 +583,8 @@ export function buildAgyCommandSpec(params: {
       ? [...params.subcommandArgs, '--disable-telemetry']
       : params.subcommandArgs;
 
+  const docRuntime = resolveDocRuntimeLayout(params.config.docRuntimeDir);
+
   const wantsSandbox =
     Boolean(params.enableSandboxBwrap) &&
     params.config.sandboxMode !== 'off' &&
@@ -616,6 +623,29 @@ export function buildAgyCommandSpec(params: {
       '/etc/group',
     ];
 
+    try {
+      const fontCacheReal = fs.realpathSync('/var/cache/fontconfig');
+      if (fs.statSync(fontCacheReal).isDirectory()) {
+        bwrapArgs.push('--dir', '/var/cache', '--ro-bind', fontCacheReal, '/var/cache/fontconfig');
+      }
+    } catch {
+      // Ignore absent host fontconfig cache
+    }
+
+    let optDirMounted = false;
+    const ensureOptDir = () => {
+      if (!optDirMounted) {
+        bwrapArgs.push('--dir', '/opt');
+        optDirMounted = true;
+      }
+    };
+
+    if (docRuntime) {
+      ensureOptDir();
+      bwrapArgs.push('--ro-bind', docRuntime.hostDir, SANDBOX_DOC_RUNTIME_MOUNT);
+      applyDocRuntimeToEnv(env, SANDBOX_DOC_RUNTIME_MOUNT, docRuntime);
+    }
+
     const resolvedAgy = resolveCanonicalAgyBin(params.config.agyBin, env.PATH);
     let sandboxAgyCommand = resolvedAgy;
 
@@ -623,7 +653,8 @@ export function buildAgyCommandSpec(params: {
       if (isInsideSystemMountTree(resolvedAgy, mountedSystemDirs)) {
         sandboxAgyCommand = resolvedAgy;
       } else {
-        bwrapArgs.push('--dir', '/opt', '--dir', '/opt/agy', '--ro-bind', resolvedAgy, '/opt/agy/agy');
+        ensureOptDir();
+        bwrapArgs.push('--dir', '/opt/agy', '--ro-bind', resolvedAgy, '/opt/agy/agy');
         env.PATH = `/opt/agy:${env.PATH || '/usr/local/bin:/usr/bin:/bin'}`;
         sandboxAgyCommand = '/opt/agy/agy';
       }
@@ -738,6 +769,10 @@ export function buildAgyCommandSpec(params: {
       : undefined,
   });
 
+  if (docRuntime) {
+    applyDocRuntimeToEnv(env, docRuntime.hostDir, docRuntime);
+  }
+
   return {
     command: resolveCanonicalAgyBin(params.config.agyBin, env.PATH),
     args: agyArgs,
@@ -745,4 +780,100 @@ export function buildAgyCommandSpec(params: {
     sandboxed: false,
     sandboxWorkspaceRoot: workspaceFallback,
   };
+}
+
+interface DocRuntimeLayout {
+  hostDir: string;
+  venvBinRel: string | null;
+  nodeModulesRel: string | null;
+  nodeBinRel: string | null;
+  pythonSiteRels: string[];
+}
+
+function resolveDocRuntimeLayout(rawDir?: string | null): DocRuntimeLayout | null {
+  if (!rawDir || !rawDir.trim()) return null;
+  let hostDir: string;
+  try {
+    hostDir = fs.realpathSync(path.resolve(rawDir));
+    if (!fs.statSync(hostDir).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+
+  const hasDir = (rel: string): string | null => {
+    try {
+      const full = path.join(hostDir, rel);
+      return fs.statSync(full).isDirectory() ? rel : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const venvBinRel = hasDir(path.join('venv', 'bin'));
+  const nodeModulesRel = hasDir(path.join('node', 'node_modules')) ?? hasDir('node_modules');
+  const nodeBinRel =
+    hasDir(path.join('node', 'node_modules', '.bin')) ?? hasDir(path.join('node_modules', '.bin'));
+
+  const pythonSiteRels: string[] = [];
+  for (const libName of ['lib', 'lib64']) {
+    const libDir = path.join(hostDir, 'venv', libName);
+    try {
+      if (!fs.statSync(libDir).isDirectory()) continue;
+      for (const entry of fs.readdirSync(libDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !entry.name.startsWith('python')) continue;
+        const siteRel = path.join('venv', libName, entry.name, 'site-packages');
+        if (hasDir(siteRel)) {
+          pythonSiteRels.push(siteRel);
+        }
+      }
+    } catch {
+      // ignore missing python lib dir
+    }
+  }
+
+  if (!venvBinRel && !nodeModulesRel && pythonSiteRels.length === 0) {
+    return null;
+  }
+
+  return {
+    hostDir,
+    venvBinRel,
+    nodeModulesRel,
+    nodeBinRel,
+    pythonSiteRels,
+  };
+}
+
+function applyDocRuntimeToEnv(
+  env: NodeJS.ProcessEnv,
+  mountRoot: string,
+  layout: DocRuntimeLayout
+): void {
+  const pathPrefix: string[] = [];
+  if (layout.venvBinRel) {
+    pathPrefix.push(path.posix.join(mountRoot, layout.venvBinRel.split(path.sep).join(path.posix.sep)));
+  }
+  if (layout.nodeBinRel) {
+    pathPrefix.push(path.posix.join(mountRoot, layout.nodeBinRel.split(path.sep).join(path.posix.sep)));
+  }
+  if (pathPrefix.length > 0) {
+    env.PATH = `${pathPrefix.join(path.delimiter)}:${env.PATH || '/usr/local/bin:/usr/bin:/bin'}`;
+  }
+
+  if (layout.nodeModulesRel) {
+    const nm = path.posix.join(mountRoot, layout.nodeModulesRel.split(path.sep).join(path.posix.sep));
+    env.NODE_PATH = env.NODE_PATH ? `${nm}${path.delimiter}${env.NODE_PATH}` : nm;
+  }
+
+  if (layout.pythonSiteRels.length > 0) {
+    const sites = layout.pythonSiteRels.map((r) =>
+      path.posix.join(mountRoot, r.split(path.sep).join(path.posix.sep))
+    );
+    env.PYTHONPATH = env.PYTHONPATH
+      ? `${sites.join(path.delimiter)}${path.delimiter}${env.PYTHONPATH}`
+      : sites.join(path.delimiter);
+  }
+
+  env.PYTHONIOENCODING = 'utf-8';
+  env.SAL_USE_VCLPLUGIN = 'svp';
 }

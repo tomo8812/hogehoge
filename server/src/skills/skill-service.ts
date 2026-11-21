@@ -19,6 +19,9 @@ import type {
 } from '../types.js';
 
 const PROJECT_SYNC_MARKER = '.agy-project-skill';
+const BUILTIN_SYNC_MARKER = '.agy-builtin-skill';
+const BUILTIN_STATE_FILENAME = '.builtin-skills-state.json';
+const BUILTIN_MANIFEST_FILENAME = '.builtin-skills-manifest.json';
 
 export class SkillValidationError extends Error {
   public readonly statusCode: number;
@@ -247,7 +250,15 @@ function listSkillResourceFiles(skillDir: string): SkillResourceFile[] {
 
   const walk = (dir: string, prefix = '') => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === PROJECT_SYNC_MARKER) continue;
+      if (
+        entry.name === '.git' ||
+        entry.name === 'node_modules' ||
+        entry.name === '__pycache__' ||
+        entry.name === PROJECT_SYNC_MARKER ||
+        entry.name === BUILTIN_SYNC_MARKER
+      ) {
+        continue;
+      }
       if (prefix === '' && entry.name === 'SKILL.md') continue;
       if (entry.isSymbolicLink()) continue;
       const full = path.join(dir, entry.name);
@@ -277,7 +288,15 @@ function copyDirectoryRecursive(srcDir: string, dstDir: string): void {
   const rootReal = fs.realpathSync(srcDir);
   const walk = (dir: string, relBase = '') => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === PROJECT_SYNC_MARKER || entry.name === '.git' || entry.name === 'node_modules') continue;
+      if (
+        entry.name === PROJECT_SYNC_MARKER ||
+        entry.name === BUILTIN_SYNC_MARKER ||
+        entry.name === '.git' ||
+        entry.name === '__pycache__' ||
+        entry.name === 'node_modules'
+      ) {
+        continue;
+      }
       if (entry.isSymbolicLink()) continue;
       const full = path.join(dir, entry.name);
       const real = fs.realpathSync(full);
@@ -289,6 +308,14 @@ function copyDirectoryRecursive(srcDir: string, dstDir: string): void {
         walk(real, rel);
       } else if (entry.isFile()) {
         copyFileWithCowFallback(real, target);
+        try {
+          const st = fs.statSync(real);
+          if ((st.mode & 0o111) !== 0 || rel.startsWith('scripts/')) {
+            fs.chmodSync(target, 0o700);
+          }
+        } catch {
+          // ignore chmod errors
+        }
       }
     }
   };
@@ -658,6 +685,234 @@ export class SkillService {
     return affectedChatIds;
   }
 
+  private readBuiltinManifest(): {
+    source: string;
+    manifestDigest: string;
+    skills: Record<string, { sha256: string }>;
+  } | null {
+    const baseDir = this.config.builtinSkillsDir;
+    if (!baseDir || !fs.existsSync(baseDir)) return null;
+    const manifestPath = path.join(baseDir, BUILTIN_MANIFEST_FILENAME);
+    if (!fs.existsSync(manifestPath)) return null;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as {
+        source?: unknown;
+        manifestDigest?: unknown;
+        skills?: Record<string, { sha256?: unknown }>;
+      };
+      if (!parsed || typeof parsed !== 'object' || !parsed.skills || typeof parsed.skills !== 'object') {
+        return null;
+      }
+      const skills: Record<string, { sha256: string }> = {};
+      for (const [slug, meta] of Object.entries(parsed.skills)) {
+        if (meta && typeof meta.sha256 === 'string' && meta.sha256) {
+          skills[slug] = { sha256: meta.sha256 };
+        }
+      }
+      if (Object.keys(skills).length === 0) return null;
+      return {
+        source: typeof parsed.source === 'string' && parsed.source ? parsed.source : 'anthropics/skills',
+        manifestDigest: typeof parsed.manifestDigest === 'string' ? parsed.manifestDigest : '',
+        skills,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private readProfileBuiltinState(configDir: string): {
+    manifestDigest: string;
+    skills: Record<string, { status: 'synced' | 'disabled' | 'customized' | 'deleted'; sha256?: string }>;
+  } {
+    const statePath = path.join(configDir, BUILTIN_STATE_FILENAME);
+    if (!fs.existsSync(statePath)) {
+      return { manifestDigest: '', skills: {} };
+    }
+    try {
+      const parsed = JSON.parse(fs.readFileSync(statePath, 'utf8')) as {
+        manifestDigest?: unknown;
+        skills?: Record<string, { status?: unknown; sha256?: unknown }>;
+      };
+      const skills: Record<string, { status: 'synced' | 'disabled' | 'customized' | 'deleted'; sha256?: string }> = {};
+      if (parsed && parsed.skills && typeof parsed.skills === 'object') {
+        for (const [k, v] of Object.entries(parsed.skills)) {
+          if (
+            v &&
+            (v.status === 'synced' || v.status === 'disabled' || v.status === 'customized' || v.status === 'deleted')
+          ) {
+            skills[k] = {
+              status: v.status,
+              ...(typeof v.sha256 === 'string' ? { sha256: v.sha256 } : {}),
+            };
+          }
+        }
+      }
+      return {
+        manifestDigest: typeof parsed?.manifestDigest === 'string' ? parsed.manifestDigest : '',
+        skills,
+      };
+    } catch {
+      return { manifestDigest: '', skills: {} };
+    }
+  }
+
+  private writeProfileBuiltinState(
+    configDir: string,
+    state: {
+      manifestDigest: string;
+      skills: Record<string, { status: 'synced' | 'disabled' | 'customized' | 'deleted'; sha256?: string }>;
+    }
+  ): void {
+    fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    const statePath = path.join(configDir, BUILTIN_STATE_FILENAME);
+    const tmpPath = `${statePath}.tmp.${process.pid}`;
+    fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
+    fs.renameSync(tmpPath, statePath);
+  }
+
+  private readBuiltinMarker(skillDir: string): { slug?: string; sha256?: string } | null {
+    const markerPath = path.join(skillDir, BUILTIN_SYNC_MARKER);
+    if (!fs.existsSync(markerPath)) return null;
+    try {
+      return JSON.parse(fs.readFileSync(markerPath, 'utf8')) as { slug?: string; sha256?: string };
+    } catch {
+      return {};
+    }
+  }
+
+  private markBuiltinSkillStateOnUserMutation(
+    roots: ResolvedScopeRoots,
+    slug: string,
+    skillDir: string | null,
+    status: 'synced' | 'disabled' | 'customized' | 'deleted'
+  ): void {
+    if (roots.projectId !== null || roots.chatId !== null) return;
+    const configDir = path.dirname(roots.enabledDir);
+    const state = this.readProfileBuiltinState(configDir);
+    const marker = skillDir ? this.readBuiltinMarker(skillDir) : null;
+    if (!marker && !state.skills[slug]) return;
+
+    if (status === 'customized' && skillDir) {
+      fs.rmSync(path.join(skillDir, BUILTIN_SYNC_MARKER), { force: true });
+    }
+    state.skills[slug] = {
+      status,
+      ...(marker?.sha256 && (status === 'synced' || status === 'disabled') ? { sha256: marker.sha256 } : {}),
+    };
+    this.writeProfileBuiltinState(configDir, state);
+  }
+
+  syncBuiltinSkillsToProfile(profileDir: string): { synced: string[]; skipped: string[] } {
+    const manifest = this.readBuiltinManifest();
+    if (!manifest) return { synced: [], skipped: [] };
+
+    const configDir = path.join(profileDir, '.gemini', 'config');
+    const enabledRoot = path.join(configDir, 'skills');
+    const disabledRoot = path.join(configDir, 'skills-disabled');
+    fs.mkdirSync(enabledRoot, { recursive: true, mode: 0o700 });
+
+    const state = this.readProfileBuiltinState(configDir);
+
+    // Fast path when current manifest is already synced and managed dirs remain intact
+    if (state.manifestDigest && state.manifestDigest === manifest.manifestDigest) {
+      const allPresent = Object.keys(manifest.skills).every((rawSlug) => {
+        const entry = state.skills[rawSlug];
+        if (!entry) return false;
+        if (entry.status === 'deleted' || entry.status === 'customized') return true;
+        if (entry.status === 'disabled') {
+          return fs.existsSync(path.join(disabledRoot, rawSlug, 'SKILL.md'));
+        }
+        return fs.existsSync(path.join(enabledRoot, rawSlug, 'SKILL.md'));
+      });
+      if (allPresent) {
+        return { synced: [], skipped: [] };
+      }
+    }
+
+    const synced: string[] = [];
+    const skipped: string[] = [];
+
+    for (const [rawSlug, info] of Object.entries(manifest.skills)) {
+      let slug: string;
+      try {
+        slug = validateSkillSlug(rawSlug);
+      } catch {
+        continue;
+      }
+
+      const srcSkillDir = path.join(this.config.builtinSkillsDir, slug);
+      if (!fs.existsSync(path.join(srcSkillDir, 'SKILL.md'))) continue;
+
+      const prevEntry = state.skills[slug];
+      if (prevEntry?.status === 'deleted' || prevEntry?.status === 'customized') {
+        skipped.push(slug);
+        continue;
+      }
+
+      const enabledSkillDir = path.join(enabledRoot, slug);
+      const disabledSkillDir = path.join(disabledRoot, slug);
+      const hasEnabled = fs.existsSync(path.join(enabledSkillDir, 'SKILL.md'));
+      const hasDisabled = fs.existsSync(path.join(disabledSkillDir, 'SKILL.md'));
+      const enabledMarker = hasEnabled ? this.readBuiltinMarker(enabledSkillDir) : null;
+      const disabledMarker = hasDisabled ? this.readBuiltinMarker(disabledSkillDir) : null;
+
+      // Preserve user-authored canonical skills with the same slug
+      if (hasEnabled && !enabledMarker) {
+        skipped.push(slug);
+        continue;
+      }
+      if (hasDisabled && !disabledMarker && prevEntry?.status !== 'disabled') {
+        skipped.push(slug);
+        continue;
+      }
+
+      const installToTarget = (targetDir: string) => {
+        const parentDir = path.dirname(targetDir);
+        fs.mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+        const stageDir = path.join(parentDir, `.${slug}.builtin-tmp.${process.pid}`);
+        const oldDir = path.join(parentDir, `.${slug}.builtin-old.${process.pid}`);
+        fs.rmSync(stageDir, { recursive: true, force: true });
+        fs.rmSync(oldDir, { recursive: true, force: true });
+        copyDirectoryRecursive(srcSkillDir, stageDir);
+        fs.writeFileSync(
+          path.join(stageDir, BUILTIN_SYNC_MARKER),
+          JSON.stringify({ slug, sha256: info.sha256, source: manifest.source, syncedAt: Date.now() }) + '\n',
+          { mode: 0o600 }
+        );
+        if (fs.existsSync(targetDir)) {
+          fs.renameSync(targetDir, oldDir);
+        }
+        fs.renameSync(stageDir, targetDir);
+        fs.rmSync(oldDir, { recursive: true, force: true });
+      };
+
+      if (hasDisabled && (disabledMarker || prevEntry?.status === 'disabled')) {
+        if (disabledMarker?.sha256 !== info.sha256) {
+          installToTarget(disabledSkillDir);
+          synced.push(slug);
+        }
+        state.skills[slug] = { status: 'disabled', sha256: info.sha256 };
+        continue;
+      }
+
+      if (!hasEnabled || enabledMarker?.sha256 !== info.sha256) {
+        installToTarget(enabledSkillDir);
+        synced.push(slug);
+      }
+      state.skills[slug] = { status: 'synced', sha256: info.sha256 };
+    }
+
+    state.manifestDigest = manifest.manifestDigest;
+    this.writeProfileBuiltinState(configDir, state);
+    return { synced, skipped };
+  }
+
+  syncBuiltinSkillsToAllProfiles(): void {
+    for (const profileDir of this.db.listAgyProfileDirs()) {
+      this.syncBuiltinSkillsToProfile(profileDir);
+    }
+  }
+
   saveSkill(
     userId: string,
     input: {
@@ -739,6 +994,9 @@ export class SkillService {
 
     const skillMdTarget = resolveContainedWriteTarget(targetDir, 'SKILL.md');
     fs.writeFileSync(skillMdTarget.absPath, finalSkillMd, 'utf8');
+    if (input.scope === 'global') {
+      this.markBuiltinSkillStateOnUserMutation(roots, slug, targetDir, 'customized');
+    }
 
     const affectedProjectChatIds =
       input.scope === 'project' && roots.projectId
@@ -782,6 +1040,15 @@ export class SkillService {
       fs.renameSync(found.skillDir, dstDir);
     }
 
+    if (params.scope === 'global') {
+      this.markBuiltinSkillStateOnUserMutation(
+        found.roots,
+        found.slug,
+        dstDir,
+        params.enabled ? 'synced' : 'disabled'
+      );
+    }
+
     const affectedProjectChatIds =
       params.scope === 'project' && found.roots.projectId
         ? this.syncProjectSkillsToAllProjectChats(userId, found.roots.projectId)
@@ -818,6 +1085,9 @@ export class SkillService {
     params: { scope: SkillScope; slug: string; projectId?: string | null; chatId?: string | null }
   ): { affectedProjectChatIds: string[] } {
     const found = this.findSkillDir(userId, params);
+    if (params.scope === 'global') {
+      this.markBuiltinSkillStateOnUserMutation(found.roots, found.slug, found.skillDir, 'deleted');
+    }
     fs.rmSync(found.skillDir, { recursive: true, force: true });
 
     const affectedProjectChatIds =
@@ -864,7 +1134,7 @@ export class SkillService {
       throw err;
     }
 
-    if (target.relPath === PROJECT_SYNC_MARKER) {
+    if (target.relPath === PROJECT_SYNC_MARKER || target.relPath === BUILTIN_SYNC_MARKER) {
       throw new SkillValidationError('INVALID_RESOURCE_PATH', '予約済みのファイル名です。');
     }
 
@@ -876,6 +1146,9 @@ export class SkillService {
       } catch {
         // ignore chmod errors
       }
+    }
+    if (params.scope === 'global') {
+      this.markBuiltinSkillStateOnUserMutation(found.roots, found.slug, found.skillDir, 'customized');
     }
 
     const affectedProjectChatIds =
@@ -909,10 +1182,17 @@ export class SkillService {
   ): { detail: SkillDetail; affectedProjectChatIds: string[] } {
     const found = this.findSkillDir(userId, params);
     const resolved = resolveContainedExistingPath(found.skillDir, params.relPath);
-    if (resolved.relPath === 'SKILL.md' || resolved.relPath === PROJECT_SYNC_MARKER) {
+    if (
+      resolved.relPath === 'SKILL.md' ||
+      resolved.relPath === PROJECT_SYNC_MARKER ||
+      resolved.relPath === BUILTIN_SYNC_MARKER
+    ) {
       throw new SkillValidationError('CANNOT_DELETE_SKILL_MD', 'SKILL.md 自体はスキル削除から削除してください。');
     }
     fs.rmSync(resolved.absPath, { force: true });
+    if (params.scope === 'global') {
+      this.markBuiltinSkillStateOnUserMutation(found.roots, found.slug, found.skillDir, 'customized');
+    }
 
     const affectedProjectChatIds =
       params.scope === 'project' && found.roots.projectId

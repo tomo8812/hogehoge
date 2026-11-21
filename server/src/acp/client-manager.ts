@@ -564,6 +564,7 @@ export class AcpClientManager {
     profileDir: string,
     desiredModelId: string | null
   ): Promise<ParsedSessionOptions | null> {
+    this.skillService?.syncBuiltinSkillsToProfile(profileDir);
     const tempProbeCwd = path.join(profileDir, '.tmp', 'options-probe');
     fs.mkdirSync(tempProbeCwd, { recursive: true, mode: 0o700 });
     const apiKey = this.loadApiKeyForUser(userId);
@@ -1175,6 +1176,9 @@ export class AcpClientManager {
     this.evictOneIdleIfFull();
 
     fs.mkdirSync(chat.workspaceDir, { recursive: true, mode: 0o700 });
+    if (this.skillService) {
+      this.skillService.syncBuiltinSkillsToProfile(profile.profileDir);
+    }
     if (chat.projectId && this.skillService) {
       this.skillService.syncProjectSkillsToChat(userId, chat.projectId, chat.workspaceDir);
     }

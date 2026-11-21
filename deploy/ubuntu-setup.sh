@@ -7,8 +7,10 @@ set -euo pipefail
 APP_USER="${APP_USER:-antigravity}"
 APP_DIR="${APP_DIR:-/opt/antigravity-chat}"
 DATA_DIR="${DATA_DIR:-/var/lib/antigravity-chat}"
-# Keep 0 by default on 2 OCPU hosts to avoid disk bloat & CPU spikes; set 1 only if .pptx PDF conversion is needed
-INSTALL_LIBREOFFICE="${INSTALL_LIBREOFFICE:-0}"
+DOC_RUNTIME_DIR="${DOC_RUNTIME_DIR:-/opt/agy-doc-runtime}"
+INSTALL_DOC_RUNTIME="${INSTALL_DOC_RUNTIME:-auto}"
+INSTALL_LIBREOFFICE="${INSTALL_LIBREOFFICE:-auto}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "==> [1/6] Installing base OS packages (python3, poppler-utils, bubblewrap, curl, ca-certificates)..."
 export DEBIAN_FRONTEND=noninteractive
@@ -22,11 +24,6 @@ apt-get install -y --no-install-recommends \
   poppler-utils \
   bubblewrap \
   acl
-
-if [[ "${INSTALL_LIBREOFFICE}" == "1" ]]; then
-  echo "==> Installing headless LibreOffice for optional PPTX/XLS/DOC -> PDF preview conversion..."
-  apt-get install -y --no-install-recommends libreoffice-impress libreoffice-writer libreoffice-calc libreoffice-common fonts-noto-cjk
-fi
 
 if command -v bwrap >/dev/null 2>&1 \
   && [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] \
@@ -57,6 +54,19 @@ if ! command -v node >/dev/null 2>&1 || [[ "$(node -v | sed 's/v//' | cut -d. -f
 fi
 node -v
 npm -v
+
+SETUP_DOC_SCRIPT=""
+if [[ -f "${SCRIPT_DIR}/setup-doc-runtime.sh" ]]; then
+  SETUP_DOC_SCRIPT="${SCRIPT_DIR}/setup-doc-runtime.sh"
+elif [[ -f "${APP_DIR}/deploy/setup-doc-runtime.sh" ]]; then
+  SETUP_DOC_SCRIPT="${APP_DIR}/deploy/setup-doc-runtime.sh"
+fi
+if [[ -n "${SETUP_DOC_SCRIPT}" ]]; then
+  DOC_RUNTIME_DIR="${DOC_RUNTIME_DIR}" \
+  INSTALL_DOC_RUNTIME="${INSTALL_DOC_RUNTIME}" \
+  INSTALL_LIBREOFFICE="${INSTALL_LIBREOFFICE}" \
+    bash "${SETUP_DOC_SCRIPT}"
+fi
 
 echo "==> [3/6] Checking official Antigravity CLI (agy -> /usr/local/bin/agy)..."
 CANONICAL_AGY_BIN="/usr/local/bin/agy"

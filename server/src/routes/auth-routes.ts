@@ -14,6 +14,7 @@ import {
   verifyCsrfIfMutating,
 } from '../auth/session.js';
 import { ensureUserDirs } from '../files/workspace.js';
+import type { SkillService } from '../skills/skill-service.js';
 import type { SyncHub } from '../sync/hub.js';
 import type { AppBuildInfo } from '../version.js';
 
@@ -22,6 +23,7 @@ export interface RouteDeps {
   db: AppDatabase;
   hub: SyncHub;
   agyAuth: AgyAuthManager;
+  skillService?: SkillService;
   buildId?: string;
   buildInfo?: AppBuildInfo;
 }
@@ -61,7 +63,7 @@ export function requireAuth(req: FastifyRequest, reply: FastifyReply, db: AppDat
 }
 
 export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps): Promise<void> {
-  const { config, db, hub, agyAuth, buildId = 'dev', buildInfo } = deps;
+  const { config, db, hub, agyAuth, skillService, buildId = 'dev', buildInfo } = deps;
   const version = buildInfo?.version ?? config.appVersion;
   const shortSha = buildInfo?.shortSha ?? null;
   const builtAt = buildInfo?.builtAt ?? null;
@@ -131,6 +133,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
 
     const passwordHash = await hashPassword(parsed.data.password);
     ensureAgyProfileSettings(profileDir);
+    skillService?.syncBuiltinSkillsToProfile(profileDir);
     const user = db.createUser({
       id: userId,
       username: normalizedUsername,
@@ -167,12 +170,13 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: RouteDeps):
       return reply.code(401).send({ error: 'INVALID_CREDENTIALS', message: 'ユーザー名またはパスワードが正しくありません。' });
     }
 
-    ensureUserDirs({
+    const { profileDir } = ensureUserDirs({
       profilesRoot: config.profilesRoot,
       workspacesRoot: config.workspacesRoot,
       projectsRoot: config.projectsRoot,
       userId: stored.id,
     });
+    skillService?.syncBuiltinSkillsToProfile(profileDir);
 
     issueSessionCookies({ req, reply, config, db, userId: stored.id });
 

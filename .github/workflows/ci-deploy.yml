@@ -103,6 +103,9 @@ jobs:
           cp -r web/dist .bundle-stage/web/
           cp -r deploy .bundle-stage/
 
+          # Dynamically fetch latest Anthropic document skills (docx, pptx, xlsx, pdf) at build time
+          node scripts/fetch-anthropic-skills.mjs --out .bundle-stage/builtin-skills
+
           # Install ONLY pure-JS production deps for server (~41MB, zero native C++ addons)
           npm --prefix .bundle-stage ci --omit=dev --workspace=server --no-audit --no-fund
 

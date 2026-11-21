@@ -145,6 +145,7 @@ fi
 
 swap_dir "${STAGE_DIR}/server/dist" "${APP_DIR}/server/dist"
 swap_dir "${STAGE_DIR}/web/dist" "${APP_DIR}/web/dist"
+swap_dir "${STAGE_DIR}/builtin-skills" "${APP_DIR}/builtin-skills"
 
 if [[ -f "${STAGE_DIR}/BUILD_INFO.json" ]]; then
   mv -f "${STAGE_DIR}/BUILD_INFO.json" "${APP_DIR}/BUILD_INFO.json"
@@ -155,13 +156,19 @@ if [[ -d "${APP_DIR}/deploy" ]]; then
 fi
 
 if [[ "$(id -u)" -eq 0 ]] && [[ -n "${REPO_OWNER}" ]] && id "${REPO_OWNER}" >/dev/null 2>&1; then
-  chown -R "${REPO_OWNER}:${REPO_OWNER}" "${APP_DIR}/web" "${APP_DIR}/server" "${APP_DIR}/scripts" 2>/dev/null || true
+  chown -R "${REPO_OWNER}:${REPO_OWNER}" "${APP_DIR}/web" "${APP_DIR}/server" "${APP_DIR}/scripts" "${APP_DIR}/builtin-skills" 2>/dev/null || true
   chown "${REPO_OWNER}:${REPO_OWNER}" "${APP_DIR}/BUILD_INFO.json" "${APP_DIR}/.bundle-lock-sha256" 2>/dev/null || true
 fi
 
 if [[ "$(id -u)" -eq 0 ]]; then
   UNIT_FILE="${SYSTEMD_UNIT_FILE:-/etc/systemd/system/${SERVICE_NAME}}"
   NEED_DAEMON_RELOAD=0
+
+  if [[ "${AUTO_SETUP_DOC_RUNTIME:-1}" == "1" ]] && [[ -f "${APP_DIR}/deploy/setup-doc-runtime.sh" ]]; then
+    if ! bash "${APP_DIR}/deploy/setup-doc-runtime.sh"; then
+      echo "[apply-bundle] WARNING: isolated doc-runtime provisioning failed; continuing app deploy." >&2
+    fi
+  fi
 
   if command -v bwrap >/dev/null 2>&1; then
     if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] \

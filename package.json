@@ -17,6 +17,7 @@
     "build": "npm --workspace=web run build && npm --workspace=server run build",
     "typecheck": "npm --workspace=server run typecheck && npm --workspace=web run typecheck",
     "test": "npm --workspace=server run test",
+    "fetch:skills": "node scripts/fetch-anthropic-skills.mjs",
     "start": "node server/dist/index.js"
   }
 }

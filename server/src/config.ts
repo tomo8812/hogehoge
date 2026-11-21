@@ -16,6 +16,8 @@ export interface AppConfig {
   projectsRoot: string;
   uploadsRoot: string;
   artifactsCacheRoot: string;
+  builtinSkillsDir: string;
+  docRuntimeDir: string;
   dbPath: string;
   webDistDir: string;
   agyBin: string;
@@ -90,6 +92,8 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     projectsRoot: path.join(dataRoot, 'projects'),
     uploadsRoot: path.join(dataRoot, 'uploads'),
     artifactsCacheRoot: path.join(dataRoot, 'artifacts-cache'),
+    builtinSkillsDir: path.resolve(process.env.BUILTIN_SKILLS_DIR ?? path.join(repoRoot, 'builtin-skills')),
+    docRuntimeDir: path.resolve(process.env.DOC_RUNTIME_DIR ?? '/opt/agy-doc-runtime'),
     dbPath: path.resolve(process.env.DB_PATH ?? path.join(dataRoot, 'antigravity-chat.db')),
     webDistDir: path.resolve(process.env.WEB_DIST_DIR ?? path.join(repoRoot, 'web', 'dist')),
     agyBin: process.env.AGY_BIN ?? 'agy',
