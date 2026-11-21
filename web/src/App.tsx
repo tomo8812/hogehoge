@@ -44,6 +44,7 @@ import type {
   MessageActivity,
   MessageRecord,
   ParsedSessionOptions,
+  PendingElicitationRecord,
   PendingPermissionRecord,
   ProjectRecord,
   QuotaSnapshotRecord,
@@ -134,6 +135,7 @@ export const App: React.FC = () => {
   const [messages, setMessages] = useState<LiveMessage[]>([]);
   const [artifacts, setArtifacts] = useState<ArtifactRecord[]>([]);
   const [pendingPermissions, setPendingPermissions] = useState<PendingPermissionRecord[]>([]);
+  const [pendingElicitations, setPendingElicitations] = useState<PendingElicitationRecord[]>([]);
   const [activeRun, setActiveRun] = useState<RunRecord | null>(null);
   const [sessionOptions, setSessionOptions] = useState<ParsedSessionOptions | null>(null);
   const [userOptions, setUserOptions] = useState<ParsedSessionOptions | null>(null);
@@ -451,6 +453,7 @@ export const App: React.FC = () => {
       return latest;
     });
     setPendingPermissions(detail.pendingPermissions);
+    setPendingElicitations(detail.pendingElicitations ?? []);
     setActiveRun((cur) => {
       if (
         cur &&
@@ -889,6 +892,7 @@ export const App: React.FC = () => {
       setMessages([]);
       setArtifacts([]);
       setPendingPermissions([]);
+      setPendingElicitations([]);
       setActiveRun(null);
       setSessionOptions(null);
       setContextUsage(null);
@@ -901,6 +905,7 @@ export const App: React.FC = () => {
     setMessages([]);
     setArtifacts([]);
     setPendingPermissions([]);
+    setPendingElicitations([]);
     setActiveRun(null);
     setContextUsage(null);
     void loadChatDetail(activeChatId);
@@ -1243,12 +1248,18 @@ export const App: React.FC = () => {
 
           const chatTitle =
             chatsRef.current.find((c) => c.id === perm.chatId)?.title || 'Antigravity Chat';
-          const toolLabel = (perm.toolCall.title || 'ツール実行の許可').replace(/\s+/g, ' ').trim().slice(0, 90);
+          const isQuestion = perm.toolCall.toolCallId.startsWith('interaction_');
+          const toolLabel = (
+            perm.toolCall.title || (isQuestion ? 'エージェントからの質問' : 'ツール実行の許可')
+          )
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 90);
           notifyDesktopWithPushFallback({
             dedupKey: `perm-${perm.id}`,
             tag: `perm-${perm.id}`,
-            title: `確認待ち — ${chatTitle}`,
-            body: `${toolLabel} の承認が必要です。`,
+            title: `${isQuestion ? '質問待ち' : '確認待ち'} — ${chatTitle}`,
+            body: isQuestion ? toolLabel : `${toolLabel} の承認が必要です。`,
             chatId: perm.chatId,
             createdAt: evt.createdAt,
             vibrate: hapticOn ? VIBRATION_PATTERNS.permission : undefined,
@@ -1268,6 +1279,64 @@ export const App: React.FC = () => {
           );
           if (evt.chatId === curChatId) {
             setPendingPermissions((prev) => prev.filter((x) => x.id !== perm.id));
+          }
+        }
+        break;
+      }
+      case 'elicitation.requested': {
+        const elicit = p.elicitation as PendingElicitationRecord | undefined;
+        if (elicit) {
+          setChats((prev) =>
+            prev.map((c) =>
+              c.id === elicit.chatId && c.activeRun
+                ? { ...c, activeRun: { ...c.activeRun, status: 'awaiting_permission' } }
+                : c
+            )
+          );
+          if (evt.chatId === curChatId) {
+            setPendingElicitations((prev) =>
+              prev.some((x) => x.id === elicit.id) ? prev : [...prev, elicit]
+            );
+          }
+          const hapticOn = Boolean(preferencesRef.current?.hapticFeedback ?? true);
+          if (
+            !isReplayingHelloRef.current &&
+            document.visibilityState === 'visible' &&
+            Math.abs(Date.now() - evt.createdAt) < 60_000
+          ) {
+            triggerHaptic('permission', hapticOn);
+          }
+
+          const chatTitle =
+            chatsRef.current.find((c) => c.id === elicit.chatId)?.title || 'Antigravity Chat';
+          const label = (elicit.message || 'エージェントからの質問')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 90);
+          notifyDesktopWithPushFallback({
+            dedupKey: `elicit-${elicit.id}`,
+            tag: `elicit-${elicit.id}`,
+            title: `質問待ち — ${chatTitle}`,
+            body: label,
+            chatId: elicit.chatId,
+            createdAt: evt.createdAt,
+            vibrate: hapticOn ? VIBRATION_PATTERNS.permission : undefined,
+          });
+        }
+        break;
+      }
+      case 'elicitation.resolved': {
+        const elicit = p.elicitation as PendingElicitationRecord | undefined;
+        if (elicit) {
+          setChats((prev) =>
+            prev.map((c) =>
+              c.id === elicit.chatId && c.activeRun?.status === 'awaiting_permission'
+                ? { ...c, activeRun: { ...c.activeRun, status: 'running' } }
+                : c
+            )
+          );
+          if (evt.chatId === curChatId) {
+            setPendingElicitations((prev) => prev.filter((x) => x.id !== elicit.id));
           }
         }
         break;
@@ -1943,6 +2012,10 @@ export const App: React.FC = () => {
     setPendingPermissions((prev) => prev.filter((x) => x.id !== perm.id));
   }, []);
 
+  const handleElicitationUpdated = useCallback((elicit: PendingElicitationRecord) => {
+    setPendingElicitations((prev) => prev.filter((x) => x.id !== elicit.id));
+  }, []);
+
   const handleNewChatForProject = useCallback(
     (projId?: string | null) => {
       handleStartDraftChat(projId ?? null);
@@ -1999,6 +2072,7 @@ export const App: React.FC = () => {
     setMessages([]);
     setArtifacts([]);
     setPendingPermissions([]);
+    setPendingElicitations([]);
     setActiveRun(null);
     setContextUsage(null);
     setChats([]);
@@ -2111,6 +2185,7 @@ export const App: React.FC = () => {
             messages={messages}
             artifacts={artifacts}
             pendingPermissions={pendingPermissions}
+            pendingElicitations={pendingElicitations}
             activeRun={activeRun}
             sessionOptions={effectiveSessionOptions}
             availableCommands={mergedAvailableCommands}
@@ -2134,6 +2209,7 @@ export const App: React.FC = () => {
             onSyncProject={handleSyncProject}
             onOpenArtifact={openAndTrackArtifact}
             onPermissionUpdated={handlePermissionUpdated}
+            onElicitationUpdated={handleElicitationUpdated}
             onOpenSkills={handleOpenSkills}
             externalDraftCommand={externalDraftCommand}
           />

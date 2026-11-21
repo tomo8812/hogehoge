@@ -269,6 +269,7 @@ function buildAvailableCommandsForSession(home: string, cwd: string) {
 function runAcpServer(): void {
   const sessions = new Map<string, SessionState>();
   let seqCounter = 0;
+  let advertisedCapabilities: Record<string, unknown> | undefined;
 
   const requireAuthenticated = () => {
     const auth = readMockAuth();
@@ -280,6 +281,7 @@ function runAcpServer(): void {
 
   const app = agent({ name: 'mock-agy-acp' })
     .onRequest(methods.agent.initialize, async ({ params }) => {
+      advertisedCapabilities = params.clientCapabilities as Record<string, unknown> | undefined;
       if (process.env.MOCK_CLIENT_INFO_PATH) {
         try {
           fs.writeFileSync(
@@ -937,6 +939,126 @@ function runAcpServer(): void {
           update: {
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: 'セッション間メッセージを受信しました。' },
+          },
+        });
+        return { stopReason: 'end_turn' as const };
+      }
+
+      // [QUESTION_INTERACTION]: simulate agy acp ask_question via session/request_permission with interaction_* toolCallId
+      if (promptText.includes('[QUESTION_INTERACTION]')) {
+        const questionRes = await ctx.client.request(methods.client.session.requestPermission, {
+          sessionId: state.id,
+          toolCall: {
+            toolCallId: 'interaction_q1',
+            title: 'どのフレームワークを使用しますか？',
+            status: 'pending',
+          },
+          options: [
+            { optionId: '1', name: 'React + Vite', kind: 'allow_once' },
+            { optionId: '2', name: 'Next.js App Router', kind: 'allow_once' },
+            { optionId: 'skip', name: 'スキップ', kind: 'reject_once' },
+          ],
+        });
+        const text =
+          questionRes.outcome.outcome === 'selected'
+            ? `質問への回答: optionId=${questionRes.outcome.optionId}`
+            : `質問キャンセル: ${questionRes.outcome.outcome}`;
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text },
+          },
+        });
+        return { stopReason: 'end_turn' as const };
+      }
+
+      // [ELICITATION_FORM]: simulate standard ACP elicitation/create (form mode)
+      if (promptText.includes('[ELICITATION_FORM]')) {
+        const elicitCap = (advertisedCapabilities?.elicitation ?? null) as
+          | { form?: unknown; url?: unknown }
+          | null;
+        const elicitRes = await ctx.client.request(methods.client.elicitation.create, {
+          sessionId: state.id,
+          mode: 'form',
+          message: 'プロジェクトの初期設定を選択してください。',
+          requestedSchema: {
+            type: 'object',
+            title: 'プロジェクト設定',
+            properties: {
+              framework: {
+                type: 'string',
+                title: 'フレームワーク',
+                oneOf: [
+                  { const: 'react', title: 'React' },
+                  { const: 'vue', title: 'Vue' },
+                ],
+              },
+              features: {
+                type: 'array',
+                title: '追加機能',
+                items: {
+                  anyOf: [
+                    { const: 'ts', title: 'TypeScript' },
+                    { const: 'test', title: 'Vitest' },
+                  ],
+                },
+              },
+              notes: {
+                type: 'string',
+                title: '自由記述',
+              },
+              strictMode: {
+                type: 'boolean',
+                title: 'Strictモード',
+                default: true,
+              },
+            },
+            required: ['framework'],
+          },
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: `Elicitation結果: action=${elicitRes.action}, content=${JSON.stringify(
+                'content' in elicitRes ? (elicitRes.content ?? null) : null
+              )}, capForm=${Boolean(elicitCap?.form)}, capUrl=${Boolean(elicitCap?.url)}`,
+            },
+          },
+        });
+        return { stopReason: 'end_turn' as const };
+      }
+
+      // [ELICITATION_URL]: simulate standard ACP elicitation/create (url mode) + optional elicitation/complete
+      if (promptText.includes('[ELICITATION_URL]')) {
+        const externalId = 'ext-elicit-123';
+        if (promptText.includes('[AUTO_COMPLETE_URL]')) {
+          void (async () => {
+            await delay(80);
+            if (state.cancelled) return;
+            await ctx.client.notify(methods.client.elicitation.complete, {
+              elicitationId: externalId,
+            });
+          })();
+        }
+        const elicitRes = await ctx.client.request(methods.client.elicitation.create, {
+          sessionId: state.id,
+          mode: 'url',
+          elicitationId: externalId,
+          url: 'https://example.com/auth',
+          message: '外部認証を完了してください。',
+        });
+        await sendUpdate({
+          sessionId: state.id,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: `URL Elicitation結果: action=${elicitRes.action}`,
+            },
           },
         });
         return { stopReason: 'end_turn' as const };

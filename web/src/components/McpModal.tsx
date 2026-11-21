@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, api } from '../api/client';
 import type {
   McpAuthType,
@@ -8,10 +8,10 @@ import type {
   McpTestResult,
   McpTransport,
 } from '../types';
-import { CloseIcon, ExternalLinkIcon, PlusIcon, TrashIcon } from './Icons';
+import { isStandalonePwa } from '../utils/notifications';
+import { CheckIcon, ChevronIcon, CloseIcon, ExternalLinkIcon, PlusIcon, RefreshIcon, TrashIcon } from './Icons';
 import { ModalDialog } from './ModalDialog';
 import { ToggleSwitch } from './ToggleSwitch';
-import { isStandalonePwa } from '../utils/notifications';
 
 interface McpModalProps {
   onClose: () => void;
@@ -25,19 +25,21 @@ interface EditableKeyValue {
   maskedValue?: string;
 }
 
+type EditorViewMode = 'idle' | 'connect' | 'auth' | 'configure' | 'import';
+
 const SCOPE_LABELS: Record<McpScope, string> = {
-  shared: '全プロファイル共有',
-  profile: '自プロファイルのみ',
+  shared: '共有',
+  profile: '個人',
 };
 
 const TRANSPORT_LABELS: Record<McpTransport, string> = {
-  http: 'リモート (HTTP)',
-  sse: 'リモート (SSE)',
+  http: 'HTTP',
+  sse: 'SSE',
   stdio: 'ローカル (stdio)',
 };
 
 const AUTH_LABELS: Record<McpAuthType, string> = {
-  oauth: 'OAuth 2.0 / 2.1',
+  oauth: 'OAuth 2.0',
   bearer: 'Bearer トークン',
   api_key: 'API キー',
   headers: 'カスタムヘッダー',
@@ -48,16 +50,16 @@ function uid(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
-function formatOAuthBadge(server: McpServerRecord): { label: string; tone: 'ok' | 'warn' | 'err' | 'muted' } {
+function formatServerStatusBadge(server: McpServerRecord): { label: string; tone: 'ok' | 'warn' | 'err' | 'muted' } {
   if (server.transport === 'stdio') {
-    return { label: 'stdio', tone: 'muted' };
+    return { label: 'ローカル', tone: 'muted' };
   }
   if (server.authType === 'oauth') {
     const st = server.oauth?.status ?? 'disconnected';
-    if (st === 'connected') return { label: 'OAuth 接続済', tone: 'ok' };
-    if (st === 'expired') return { label: 'OAuth 期限切れ', tone: 'warn' };
-    if (st === 'error') return { label: 'OAuth エラー', tone: 'err' };
-    return { label: 'OAuth 未認証', tone: 'warn' };
+    if (st === 'connected') return { label: '認証済', tone: 'ok' };
+    if (st === 'expired') return { label: '期限切れ', tone: 'warn' };
+    if (st === 'error') return { label: '認証エラー', tone: 'err' };
+    return { label: '未認証', tone: 'warn' };
   }
   if (server.authType === 'bearer') return { label: 'Bearer', tone: 'ok' };
   if (server.authType === 'api_key') return { label: 'APIキー', tone: 'ok' };
@@ -74,6 +76,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
   const [loading, setLoading] = useState(true);
   const [listError, setListError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [toolSavingName, setToolSavingName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState<string | null>(null);
   const [oauthPendingUrl, setOAuthPendingUrl] = useState<string | null>(null);
@@ -82,17 +85,15 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
   const [testResult, setTestResult] = useState<McpTestResult | null>(null);
 
   const [mobileShowEditor, setMobileShowEditor] = useState(false);
-  const [editorMode, setEditorMode] = useState<'idle' | 'new' | 'edit' | 'import'>('idle');
+  const [viewMode, setViewMode] = useState<EditorViewMode>('idle');
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [isSetupFlow, setIsSetupFlow] = useState(false);
 
-  // Form state
+  // Connection fields
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [transport, setTransport] = useState<McpTransport>('http');
   const [enabled, setEnabled] = useState(true);
-  const [allowedTools, setAllowedTools] = useState<string[]>([]);
-  const [toolInputDraft, setToolInputDraft] = useState('');
-  const [discoveredTools, setDiscoveredTools] = useState<McpDiscoveredTool[]>([]);
 
   // Local (stdio)
   const [command, setCommand] = useState('');
@@ -111,8 +112,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
   const [existingApiKeyMask, setExistingApiKeyMask] = useState('');
   const [headerRows, setHeaderRows] = useState<EditableKeyValue[]>([]);
 
-  // OAuth advanced settings
-  const [showOAuthAdvanced, setShowOAuthAdvanced] = useState(false);
+  // OAuth client fields
   const [oauthClientId, setOAuthClientId] = useState('');
   const [oauthClientSecret, setOAuthClientSecret] = useState('');
   const [clearClientSecret, setClearClientSecret] = useState(false);
@@ -121,9 +121,19 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
   const [oauthScopes, setOAuthScopes] = useState('');
   const [oauthExtraParamsText, setOAuthExtraParamsText] = useState('');
 
+  // Post-connection tool settings
+  const [discoveredTools, setDiscoveredTools] = useState<McpDiscoveredTool[]>([]);
+  const [allowedTools, setAllowedTools] = useState<string[]>([]);
+  const [disabledTools, setDisabledTools] = useState<string[]>([]);
+  const [alwaysAllowTools, setAlwaysAllowTools] = useState<string[]>([]);
+  const [expandedToolDescs, setExpandedToolDescs] = useState<Record<string, boolean>>({});
+  const [toolInputDraft, setToolInputDraft] = useState('');
+
   // JSON import state
   const [importJsonText, setImportJsonText] = useState('');
   const [importOverwrite, setImportOverwrite] = useState(false);
+
+  const autoProbedServerIdRef = useRef<string | null>(null);
 
   const loadServers = useCallback(async () => {
     setLoading(true);
@@ -134,7 +144,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
       if (res.callbackUrl) setCallbackUrl(res.callbackUrl);
       return res.servers;
     } catch (err) {
-      setListError(err instanceof ApiError ? err.message : 'MCPサーバー一覧の読込に失敗しました。');
+      setListError(err instanceof ApiError ? err.message : 'サーバー一覧を読み込めませんでした。');
       return null;
     } finally {
       setLoading(false);
@@ -145,126 +155,190 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     void loadServers();
   }, [loadServers]);
 
-  const populateFormFromServer = useCallback((srv: McpServerRecord) => {
-    setSelectedId(srv.id);
-    setEditorMode('edit');
-    setName(srv.name);
-    setDescription(srv.description);
-    setTransport(srv.transport);
-    setEnabled(srv.enabled);
-    setAllowedTools(srv.allowedTools ?? []);
-    setToolInputDraft('');
-    setDiscoveredTools([]);
-    setCommand(srv.command ?? '');
-    setArgsText(srv.args.join('\n'));
-    setEnvRows(
-      srv.env.map((e) => ({
-        id: uid(),
-        name: e.name,
-        value: '',
-        keepExisting: e.hasValue,
-        maskedValue: e.maskedValue,
-      }))
-    );
-    setUrl(srv.url ?? '');
-    setAuthType(srv.authType);
+  const populateServerState = useCallback(
+    (srv: McpServerRecord, nextMode: 'auth' | 'configure', opts?: { setupFlow?: boolean; keepNotice?: boolean }) => {
+      setSelectedId(srv.id);
+      setViewMode(nextMode);
+      setIsSetupFlow(Boolean(opts?.setupFlow));
+      setName(srv.name);
+      setDescription(srv.description);
+      setTransport(srv.transport);
+      setEnabled(srv.enabled);
+      setDiscoveredTools(srv.discoveredTools ?? []);
+      setAllowedTools(srv.allowedTools ?? []);
+      setDisabledTools(srv.disabledTools ?? []);
+      setAlwaysAllowTools(srv.alwaysAllowTools ?? []);
+      setExpandedToolDescs({});
+      setToolInputDraft('');
 
-    // Populate bearer / api_key / headers cleanly
-    const authHeader = srv.headers.find((h) => h.name.toLowerCase() === 'authorization');
-    if (srv.authType === 'bearer' && authHeader) {
-      setKeepExistingBearer(authHeader.hasValue);
-      setExistingBearerMask(authHeader.maskedValue);
-      setBearerToken('');
-      setHeaderRows(
-        srv.headers
-          .filter((h) => h.name.toLowerCase() !== 'authorization')
-          .map((h) => ({
+      setCommand(srv.command ?? '');
+      setArgsText(srv.args.join('\n'));
+      setEnvRows(
+        srv.env.map((e) => ({
+          id: uid(),
+          name: e.name,
+          value: '',
+          keepExisting: e.hasValue,
+          maskedValue: e.maskedValue,
+        }))
+      );
+      setUrl(srv.url ?? '');
+      setAuthType(srv.authType);
+
+      const authHeader = srv.headers.find((h) => h.name.toLowerCase() === 'authorization');
+      if (srv.authType === 'bearer' && authHeader) {
+        setKeepExistingBearer(authHeader.hasValue);
+        setExistingBearerMask(authHeader.maskedValue);
+        setBearerToken('');
+        setHeaderRows(
+          srv.headers
+            .filter((h) => h.name.toLowerCase() !== 'authorization')
+            .map((h) => ({
+              id: uid(),
+              name: h.name,
+              value: '',
+              keepExisting: h.hasValue,
+              maskedValue: h.maskedValue,
+            }))
+        );
+        setApiKeyHeaderName('X-API-Key');
+        setApiKeyValue('');
+        setKeepExistingApiKey(false);
+        setExistingApiKeyMask('');
+      } else if (srv.authType === 'api_key' && srv.headers.length > 0) {
+        const primary = srv.headers[0];
+        setApiKeyHeaderName(primary.name);
+        setKeepExistingApiKey(primary.hasValue);
+        setExistingApiKeyMask(primary.maskedValue);
+        setApiKeyValue('');
+        setHeaderRows(
+          srv.headers.slice(1).map((h) => ({
             id: uid(),
             name: h.name,
             value: '',
             keepExisting: h.hasValue,
             maskedValue: h.maskedValue,
           }))
-      );
-      setApiKeyHeaderName('X-API-Key');
-      setApiKeyValue('');
-      setKeepExistingApiKey(false);
-      setExistingApiKeyMask('');
-    } else if (srv.authType === 'api_key' && srv.headers.length > 0) {
-      const primary = srv.headers[0];
-      setApiKeyHeaderName(primary.name);
-      setKeepExistingApiKey(primary.hasValue);
-      setExistingApiKeyMask(primary.maskedValue);
-      setApiKeyValue('');
-      setHeaderRows(
-        srv.headers.slice(1).map((h) => ({
-          id: uid(),
-          name: h.name,
-          value: '',
-          keepExisting: h.hasValue,
-          maskedValue: h.maskedValue,
-        }))
-      );
-      setBearerToken('');
-      setKeepExistingBearer(false);
-      setExistingBearerMask('');
-    } else {
-      setBearerToken('');
-      setKeepExistingBearer(false);
-      setExistingBearerMask('');
-      setApiKeyHeaderName('X-API-Key');
-      setApiKeyValue('');
-      setKeepExistingApiKey(false);
-      setExistingApiKeyMask('');
-      setHeaderRows(
-        srv.headers.map((h) => ({
-          id: uid(),
-          name: h.name,
-          value: '',
-          keepExisting: h.hasValue,
-          maskedValue: h.maskedValue,
-        }))
-      );
-    }
+        );
+        setBearerToken('');
+        setKeepExistingBearer(false);
+        setExistingBearerMask('');
+      } else {
+        setBearerToken('');
+        setKeepExistingBearer(false);
+        setExistingBearerMask('');
+        setApiKeyHeaderName('X-API-Key');
+        setApiKeyValue('');
+        setKeepExistingApiKey(false);
+        setExistingApiKeyMask('');
+        setHeaderRows(
+          srv.headers.map((h) => ({
+            id: uid(),
+            name: h.name,
+            value: '',
+            keepExisting: h.hasValue,
+            maskedValue: h.maskedValue,
+          }))
+        );
+      }
 
-    setOAuthClientId(srv.oauth?.clientId ?? '');
-    setOAuthClientSecret('');
-    setClearClientSecret(false);
-    setOAuthAuthUrl(srv.oauth?.authorizationUrl ?? '');
-    setOAuthTokenUrl(srv.oauth?.tokenUrl ?? '');
-    setOAuthScopes(srv.oauth?.scopes ?? '');
-    const extraPairs = Object.entries(srv.oauth?.extraAuthParams ?? {}).map(([k, v]) => `${k}=${v}`);
-    setOAuthExtraParamsText(extraPairs.join('\n'));
-    setShowOAuthAdvanced(Boolean(srv.oauth?.clientId || srv.oauth?.authorizationUrl || srv.oauth?.scopes));
-    setTestResult(null);
-    setOAuthPendingUrl(null);
-    setOAuthPendingState(null);
-    setOAuthManualInput('');
-    setError(null);
-    setStatusNote(null);
-    setMobileShowEditor(true);
-  }, []);
+      setOAuthClientId(srv.oauth?.clientId ?? '');
+      setOAuthClientSecret('');
+      setClearClientSecret(false);
+      setOAuthAuthUrl(srv.oauth?.authorizationUrl ?? '');
+      setOAuthTokenUrl(srv.oauth?.tokenUrl ?? '');
+      setOAuthScopes(srv.oauth?.scopes ?? '');
+      const extraPairs = Object.entries(srv.oauth?.extraAuthParams ?? {}).map(([k, v]) => `${k}=${v}`);
+      setOAuthExtraParamsText(extraPairs.join('\n'));
 
-  // Listen for OAuth completion across postMessage, BroadcastChannel, localStorage, SyncHub WS, and iOS PWA visibility/focus
-  useEffect(() => {
-    const handleCompletePayload = (data: {
-      type?: string;
-      ok?: boolean;
-      serverId?: string;
-      message?: string;
-    } | null) => {
-      if (!data || data.type !== 'agy-mcp-oauth-complete') return;
+      if (!opts?.keepNotice) {
+        setTestResult(null);
+        setError(null);
+        setStatusNote(null);
+      }
       setOAuthPendingUrl(null);
       setOAuthPendingState(null);
       setOAuthManualInput('');
-      void loadServers().then(() => {
-        if (data.ok) {
-          setStatusNote(data.message || 'OAuth認証が完了しました。');
-          setError(null);
+      setMobileShowEditor(true);
+    },
+    []
+  );
+
+  const transitionToConfigureWithToolDiscovery = useCallback(
+    async (srv: McpServerRecord, opts?: { setupFlow?: boolean; statusMsg?: string }) => {
+      populateServerState(srv, 'configure', {
+        setupFlow: opts?.setupFlow,
+        keepNotice: true,
+      });
+      setStatusNote(opts?.statusMsg ?? 'ツール一覧を取得しています...');
+      setError(null);
+      try {
+        const res = await api.testMcpServer(srv.id);
+        setTestResult(res.result);
+        if (res.server) {
+          setDiscoveredTools(res.server.discoveredTools ?? []);
+          setServers((prev) => prev.map((s) => (s.id === res.server!.id ? res.server! : s)));
+        } else if (res.result.tools) {
+          setDiscoveredTools(res.result.tools);
+        }
+        if (res.result.ok) {
+          const count = res.result.tools?.length ?? res.server?.discoveredTools?.length ?? 0;
+          setStatusNote(
+            count > 0
+              ? `接続を確認しました。${count} 件のツールを利用できます。`
+              : opts?.statusMsg ?? '接続を確認しました。'
+          );
         } else {
-          setError(data.message || 'OAuth認証に失敗しました。');
+          setStatusNote(null);
+          setError(res.result.message);
+        }
+      } catch (err) {
+        setStatusNote(opts?.statusMsg ?? null);
+        setError(err instanceof ApiError ? err.message : 'ツール一覧の取得に失敗しました。');
+      }
+    },
+    [populateServerState]
+  );
+
+  // Listen for OAuth completion across postMessage, BroadcastChannel, localStorage, SyncHub WS, and PWA focus
+  useEffect(() => {
+    const handleOAuthSuccess = (targetServerId: string | null | undefined, message?: string) => {
+      setOAuthPendingUrl(null);
+      setOAuthPendingState(null);
+      setOAuthManualInput('');
+      void loadServers().then((latest) => {
+        if (!latest) return;
+        const target =
+          (targetServerId ? latest.find((s) => s.id === targetServerId) : null) ??
+          (selectedId ? latest.find((s) => s.id === selectedId) : null);
+        if (target && target.oauth?.status === 'connected') {
+          void transitionToConfigureWithToolDiscovery(target, {
+            setupFlow: isSetupFlow || viewMode === 'auth',
+            statusMsg: message || `「${target.name}」の認証が完了しました。`,
+          });
+        } else if (message) {
+          setStatusNote(message);
+          setError(null);
         }
       });
+    };
+
+    const handleCompletePayload = (
+      data: {
+        type?: string;
+        ok?: boolean;
+        serverId?: string;
+        message?: string;
+      } | null
+    ) => {
+      if (!data || data.type !== 'agy-mcp-oauth-complete') return;
+      if (data.ok) {
+        handleOAuthSuccess(data.serverId, data.message || '認証が完了しました。');
+      } else {
+        setOAuthPendingUrl(null);
+        setOAuthPendingState(null);
+        setError(data.message || '認証を完了できませんでした。');
+      }
     };
 
     const onMessage = (evt: MessageEvent) => {
@@ -296,12 +370,8 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
         if (!latest || !selectedId) return;
         const target = latest.find((s) => s.id === selectedId);
         if (!target || target.authType !== 'oauth') return;
-        if (target.oauth?.status === 'connected' && oauthPendingUrl) {
-          setOAuthPendingUrl(null);
-          setOAuthPendingState(null);
-          setOAuthManualInput('');
-          setStatusNote(`MCPサーバー「${target.name}」のOAuth認証が完了しました。`);
-          setError(null);
+        if (target.oauth?.status === 'connected' && (oauthPendingUrl || viewMode === 'auth')) {
+          handleOAuthSuccess(target.id, `「${target.name}」の認証が完了しました。`);
         } else if (target.oauth?.status === 'error' && target.oauth?.error && oauthPendingUrl) {
           setError(target.oauth.error);
         }
@@ -313,7 +383,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     };
 
     const onVisibilityOrFocus = () => {
-      if (document.visibilityState === 'visible' && oauthPendingUrl) {
+      if (document.visibilityState === 'visible' && (oauthPendingUrl || viewMode === 'auth')) {
         refreshAndDetectConnection();
       }
     };
@@ -335,7 +405,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
         // ignore
       }
     };
-  }, [loadServers, selectedId, oauthPendingUrl]);
+  }, [loadServers, selectedId, oauthPendingUrl, viewMode, isSetupFlow, transitionToConfigureWithToolDiscovery]);
 
   const filteredServers = useMemo(
     () => servers.filter((s) => s.scope === scopeTab),
@@ -347,132 +417,41 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     [servers, selectedId]
   );
 
-  const isEditFormDirty = useMemo(() => {
-    if (editorMode !== 'edit' || !selectedServer) return false;
-    if (name.trim() !== selectedServer.name) return true;
-    if (description.trim() !== selectedServer.description) return true;
-    if (transport !== selectedServer.transport) return true;
-    if (enabled !== selectedServer.enabled) return true;
-    if (
-      allowedTools.length !== selectedServer.allowedTools.length ||
-      allowedTools.some((t, i) => t !== selectedServer.allowedTools[i])
-    ) {
-      return true;
-    }
-    if (transport === 'stdio') {
-      if (command.trim() !== (selectedServer.command ?? '')) return true;
-      const currentArgs = argsText
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0);
-      if (
-        currentArgs.length !== selectedServer.args.length ||
-        currentArgs.some((a, i) => a !== selectedServer.args[i])
-      ) {
-        return true;
-      }
-      if (envRows.length !== selectedServer.env.length) return true;
-      for (let i = 0; i < envRows.length; i += 1) {
-        const row = envRows[i];
-        const orig = selectedServer.env[i];
-        if (row.name.trim() !== orig.name || row.value.length > 0) return true;
-      }
-      return false;
-    }
-
-    if (url.trim() !== (selectedServer.url ?? '')) return true;
-    if (authType !== selectedServer.authType) return true;
-    if (bearerToken.trim().length > 0 || apiKeyValue.trim().length > 0) return true;
-    if (authType === 'api_key') {
-      const origHeaderName = selectedServer.headers[0]?.name ?? 'X-API-Key';
-      if ((apiKeyHeaderName.trim() || 'X-API-Key') !== origHeaderName) return true;
-    }
-    const origExtraHeaders =
-      selectedServer.authType === 'bearer'
-        ? selectedServer.headers.filter((h) => h.name.toLowerCase() !== 'authorization')
-        : selectedServer.authType === 'api_key'
-          ? selectedServer.headers.slice(1)
-          : selectedServer.headers;
-    if (headerRows.length !== origExtraHeaders.length) return true;
-    for (let i = 0; i < headerRows.length; i += 1) {
-      const row = headerRows[i];
-      const orig = origExtraHeaders[i];
-      if (row.name.trim() !== orig.name || row.value.length > 0) return true;
-    }
-    if (authType === 'oauth') {
-      if (oauthClientId.trim() !== (selectedServer.oauth?.clientId ?? '')) return true;
-      if (oauthClientSecret.trim().length > 0 || clearClientSecret) return true;
-      if (oauthAuthUrl.trim() !== (selectedServer.oauth?.authorizationUrl ?? '')) return true;
-      if (oauthTokenUrl.trim() !== (selectedServer.oauth?.tokenUrl ?? '')) return true;
-      if (oauthScopes.trim() !== (selectedServer.oauth?.scopes ?? '')) return true;
-      const origExtra = Object.entries(selectedServer.oauth?.extraAuthParams ?? {})
-        .map(([k, v]) => `${k}=${v}`)
-        .join('\n');
-      if (oauthExtraParamsText.trim() !== origExtra.trim()) return true;
-    }
-    return false;
-  }, [
-    editorMode,
-    selectedServer,
-    name,
-    description,
-    transport,
-    enabled,
-    allowedTools,
-    command,
-    argsText,
-    envRows,
-    url,
-    authType,
-    bearerToken,
-    apiKeyHeaderName,
-    apiKeyValue,
-    headerRows,
-    oauthClientId,
-    oauthClientSecret,
-    clearClientSecret,
-    oauthAuthUrl,
-    oauthTokenUrl,
-    oauthScopes,
-    oauthExtraParamsText,
-  ]);
-
-  const addDraftTools = () => {
-    const tokens = toolInputDraft
-      .split(/[,\s]+/)
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
-    if (tokens.length === 0) return;
-    setAllowedTools((prev) => {
-      const next = [...prev];
-      const seen = new Set(prev);
-      for (const token of tokens) {
-        if (!seen.has(token)) {
-          seen.add(token);
-          next.push(token);
+  // Auto-discover tools once when opening configure view for a connected server that has no cached tools yet
+  useEffect(() => {
+    if (viewMode !== 'configure' || !selectedServer) return;
+    if (selectedServer.discoveredTools.length > 0) return;
+    if (selectedServer.authType === 'oauth' && selectedServer.oauth?.status !== 'connected') return;
+    if (autoProbedServerIdRef.current === selectedServer.id) return;
+    autoProbedServerIdRef.current = selectedServer.id;
+    void (async () => {
+      try {
+        const res = await api.testMcpServer(selectedServer.id);
+        if (res.server) {
+          setDiscoveredTools(res.server.discoveredTools ?? []);
+          setServers((prev) => prev.map((s) => (s.id === res.server!.id ? res.server! : s)));
+        } else if (res.result.tools) {
+          setDiscoveredTools(res.result.tools);
         }
+      } catch {
+        // Keep manual refresh button available
       }
-      return next;
-    });
-    setToolInputDraft('');
-  };
+    })();
+  }, [viewMode, selectedServer]);
 
-  const toggleAllowedTool = (toolName: string) => {
-    setAllowedTools((prev) =>
-      prev.includes(toolName) ? prev.filter((t) => t !== toolName) : [...prev, toolName]
-    );
-  };
-
-  const openNewForm = (initialTransport: McpTransport = 'http') => {
+  const openConnectScreen = (initialTransport: McpTransport = 'http') => {
     setSelectedId(null);
-    setEditorMode('new');
+    setViewMode('connect');
+    setIsSetupFlow(true);
     setName('');
     setDescription('');
     setTransport(initialTransport);
     setEnabled(true);
-    setAllowedTools([]);
-    setToolInputDraft('');
     setDiscoveredTools([]);
+    setAllowedTools([]);
+    setDisabledTools([]);
+    setAlwaysAllowTools([]);
+    setExpandedToolDescs({});
     setCommand('');
     setArgsText('');
     setEnvRows([]);
@@ -486,7 +465,6 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     setKeepExistingApiKey(false);
     setExistingApiKeyMask('');
     setHeaderRows([]);
-    setShowOAuthAdvanced(false);
     setOAuthClientId('');
     setOAuthClientSecret('');
     setClearClientSecret(false);
@@ -496,6 +474,8 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     setOAuthExtraParamsText('');
     setTestResult(null);
     setOAuthPendingUrl(null);
+    setOAuthPendingState(null);
+    setOAuthManualInput('');
     setError(null);
     setStatusNote(null);
     setMobileShowEditor(true);
@@ -503,7 +483,8 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
 
   const openImportForm = () => {
     setSelectedId(null);
-    setEditorMode('import');
+    setViewMode('import');
+    setIsSetupFlow(false);
     setImportJsonText('');
     setImportOverwrite(false);
     setError(null);
@@ -559,90 +540,104 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     return Object.keys(out).length > 0 ? out : null;
   };
 
-  const handleSave = async (e: React.FormEvent) => {
+  const buildConnectionPayload = () => {
+    const args = argsText
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    const env = envRows
+      .filter((r) => r.name.trim().length > 0)
+      .map((r) =>
+        r.keepExisting && !r.value
+          ? { name: r.name.trim(), keepExisting: true }
+          : { name: r.name.trim(), value: r.value }
+      );
+    const headers = transport === 'stdio' ? undefined : buildHeadersPayload();
+    const oauthConfig =
+      transport !== 'stdio' && authType === 'oauth'
+        ? {
+            clientId: oauthClientId.trim() || null,
+            ...(clearClientSecret
+              ? { clearClientSecret: true }
+              : oauthClientSecret.trim()
+                ? { clientSecret: oauthClientSecret.trim() }
+                : {}),
+            authorizationUrl: oauthAuthUrl.trim() || null,
+            tokenUrl: oauthTokenUrl.trim() || null,
+            scopes: oauthScopes.trim() || null,
+            extraAuthParams: parseExtraParams(),
+          }
+        : null;
+
+    return {
+      name: name.trim(),
+      description: description.trim(),
+      transport,
+      command: transport === 'stdio' ? command.trim() : null,
+      args: transport === 'stdio' ? args : [],
+      env: transport === 'stdio' ? env : [],
+      url: transport === 'stdio' ? null : url.trim(),
+      authType: transport === 'stdio' ? ('none' as McpAuthType) : authType,
+      headers,
+      oauthConfig,
+    };
+  };
+
+  // Step 1: Submit initial connection screen
+  const handleConnectSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setBusy(true);
+    setError(null);
+    setStatusNote(null);
+    setTestResult(null);
+
+    try {
+      const payload = buildConnectionPayload();
+      const res = await api.createMcpServer({
+        ...payload,
+        scope: scopeTab,
+        enabled: true,
+      });
+      const saved = res.server;
+      setScopeTab(saved.scope);
+      await loadServers();
+
+      if (saved.transport !== 'stdio' && saved.authType === 'oauth') {
+        populateServerState(saved, 'auth', { setupFlow: true });
+        return;
+      }
+
+      await transitionToConfigureWithToolDiscovery(saved, { setupFlow: true });
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '接続の作成に失敗しました。');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Save edited connection details from Auth or Configure view
+  const handleSaveConnectionSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedServer) return;
     setBusy(true);
     setError(null);
     setStatusNote(null);
 
     try {
-      const args = argsText
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0);
-      const env = envRows
-        .filter((r) => r.name.trim().length > 0)
-        .map((r) =>
-          r.keepExisting && !r.value
-            ? { name: r.name.trim(), keepExisting: true }
-            : { name: r.name.trim(), value: r.value }
-        );
-
-      const headers = transport === 'stdio' ? undefined : buildHeadersPayload();
-      const oauthConfig =
-        transport !== 'stdio' && authType === 'oauth'
-          ? {
-              clientId: oauthClientId.trim() || null,
-              ...(clearClientSecret
-                ? { clearClientSecret: true }
-                : oauthClientSecret.trim()
-                  ? { clientSecret: oauthClientSecret.trim() }
-                  : {}),
-              authorizationUrl: oauthAuthUrl.trim() || null,
-              tokenUrl: oauthTokenUrl.trim() || null,
-              scopes: oauthScopes.trim() || null,
-              extraAuthParams: parseExtraParams(),
-            }
-          : null;
-
-      let saved: McpServerRecord;
-      if (editorMode === 'new') {
-        const res = await api.createMcpServer({
-          name: name.trim(),
-          description: description.trim(),
-          scope: scopeTab,
-          transport,
-          enabled,
-          allowedTools,
-          command: transport === 'stdio' ? command.trim() : null,
-          args: transport === 'stdio' ? args : [],
-          env: transport === 'stdio' ? env : [],
-          url: transport === 'stdio' ? null : url.trim(),
-          authType: transport === 'stdio' ? 'none' : authType,
-          headers,
-          oauthConfig,
-        });
-        saved = res.server;
-      } else if (selectedId) {
-        const res = await api.updateMcpServer(selectedId, {
-          name: name.trim(),
-          description: description.trim(),
-          transport,
-          enabled,
-          allowedTools,
-          command: transport === 'stdio' ? command.trim() : null,
-          args: transport === 'stdio' ? args : [],
-          env: transport === 'stdio' ? env : [],
-          url: transport === 'stdio' ? null : url.trim(),
-          authType: transport === 'stdio' ? 'none' : authType,
-          headers,
-          oauthConfig,
-        });
-        saved = res.server;
-      } else {
-        return;
-      }
-
-      setScopeTab(saved.scope);
+      const payload = buildConnectionPayload();
+      const res = await api.updateMcpServer(selectedServer.id, payload);
+      const saved = res.server;
       await loadServers();
-      populateFormFromServer(saved);
-      setStatusNote(
-        saved.authType === 'oauth' && saved.oauth?.status !== 'connected'
-          ? '保存しました。「OAuth 認証を開始」から認証を完了してください。'
-          : 'MCPサーバーを保存しました。次のチャットターンから反映されます。'
-      );
+
+      if (viewMode === 'auth' && saved.authType === 'oauth') {
+        populateServerState(saved, 'auth', { setupFlow: isSetupFlow, keepNotice: true });
+        setStatusNote('クライアント設定を更新しました。');
+      } else {
+        populateServerState(saved, 'configure', { setupFlow: isSetupFlow, keepNotice: true });
+        setStatusNote('接続設定を保存しました。');
+      }
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '保存に失敗しました。');
+      setError(err instanceof ApiError ? err.message : '設定を保存できませんでした。');
     } finally {
       setBusy(false);
     }
@@ -653,25 +648,25 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     setStatusNote(null);
     try {
       const res = await api.updateMcpServer(srv.id, { enabled: next });
-      await loadServers();
+      setServers((prev) => prev.map((s) => (s.id === res.server.id ? res.server : s)));
       if (selectedId === srv.id) {
         setEnabled(res.server.enabled);
       }
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '有効状態の更新に失敗しました。');
+      setError(err instanceof ApiError ? err.message : '有効状態の切り替えに失敗しました。');
     }
   };
 
   const handleDelete = async () => {
     if (!selectedServer) return;
-    if (!window.confirm(`MCPサーバー「${selectedServer.name}」を削除しますか？`)) return;
+    if (!window.confirm(`「${selectedServer.name}」を削除しますか？`)) return;
     setBusy(true);
     setError(null);
     setStatusNote(null);
     try {
       await api.deleteMcpServer(selectedServer.id);
       setSelectedId(null);
-      setEditorMode('idle');
+      setViewMode('idle');
       setMobileShowEditor(false);
       await loadServers();
       setStatusNote(`「${selectedServer.name}」を削除しました。`);
@@ -682,24 +677,28 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     }
   };
 
-  const handleTest = async () => {
+  const handleTestAndRefreshTools = async () => {
     if (!selectedServer) return;
-    if (isEditFormDirty) {
-      setError('未保存の変更があります。先に「変更を保存」してから接続テストを実行してください。');
-      setTestResult(null);
-      return;
-    }
     setBusy(true);
     setError(null);
     setTestResult(null);
     try {
       const res = await api.testMcpServer(selectedServer.id);
       setTestResult(res.result);
-      if (res.result.tools && res.result.tools.length > 0) {
+      if (res.server) {
+        setDiscoveredTools(res.server.discoveredTools ?? []);
+        setServers((prev) => prev.map((s) => (s.id === res.server!.id ? res.server! : s)));
+      } else if (res.result.tools) {
         setDiscoveredTools(res.result.tools);
       }
+      if (res.result.ok) {
+        const count = res.result.tools?.length ?? res.server?.discoveredTools?.length ?? 0;
+        setStatusNote(count > 0 ? `${count} 件のツールを取得しました。` : res.result.message);
+      } else {
+        setError(res.result.message);
+      }
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '接続テストに失敗しました。');
+      setError(err instanceof ApiError ? err.message : '接続確認に失敗しました。');
     } finally {
       setBusy(false);
     }
@@ -708,8 +707,6 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
   const handleStartOAuth = async () => {
     if (!selectedServer) return;
     const standalone = isStandalonePwa();
-    // Pre-open a popup synchronously within the user tap gesture on non-standalone browsers
-    // so WebKit / Safari popup blockers do not block navigation after the async API call.
     const popup = !standalone
       ? window.open('about:blank', 'agy_mcp_oauth', 'width=620,height=760')
       : null;
@@ -728,21 +725,14 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
         popup.location.replace(res.authorizationUrl);
         setStatusNote(
           res.mode === 'code_paste'
-            ? '認証ウィンドウを開きました。ログイン後、リダイレクト先URLまたは認可コードを下の入力欄に貼り付けてもアプリ内で完了できます。'
-            : '認証ウィンドウを開きました。ブラウザでログイン・許可を完了してください。'
+            ? '別ウィンドウでログインしてください。完了後のURLまたはコードを下に貼り付けて完了できます。'
+            : '別ウィンドウでログインと権限の許可を完了してください。完了すると自動で次の画面へ進みます。'
         );
       } else if (standalone) {
-        // iOS Standalone PWA: navigating to the same-origin authenticated launch endpoint
-        // keeps the flow inside the PWA's own WebView (which holds the admin session cookie)
-        // before 302-redirecting to the external OAuth provider.
         window.location.assign(res.launchUrl || res.authorizationUrl);
-        setStatusNote(
-          '認証ページへ移動しました。ログイン・許可が完了すると自動で反映されます（戻った後にURLまたは認可コードを貼り付けてアプリ内で完了することも可能です）。'
-        );
+        setStatusNote('認証ページへ移動しました。完了すると自動で戻ります。');
       } else {
-        setStatusNote(
-          'ポップアップがブロックされました。下の「認証ページを開く」から認証を完了してください（完了後にURLまたは認可コードを貼り付けることも可能です）。'
-        );
+        setStatusNote('下の「認証ページを開く」からログインを完了してください。');
       }
     } catch (err) {
       if (popup && !popup.closed) {
@@ -752,7 +742,7 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
           // ignore
         }
       }
-      setError(err instanceof ApiError ? err.message : 'OAuth認証の開始に失敗しました。');
+      setError(err instanceof ApiError ? err.message : '認証ページを開けませんでした。');
     } finally {
       setBusy(false);
     }
@@ -771,13 +761,13 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
       setOAuthPendingState(null);
       setOAuthManualInput('');
       await loadServers();
-      populateFormFromServer(res.server);
-      setStatusNote(`MCPサーバー「${res.server.name}」のOAuth認証が完了しました。`);
+      await transitionToConfigureWithToolDiscovery(res.server, {
+        setupFlow: isSetupFlow || viewMode === 'auth',
+        statusMsg: `「${res.server.name}」の認証が完了しました。`,
+      });
     } catch (err) {
       setError(
-        err instanceof ApiError
-          ? err.message
-          : '認可コードまたはコールバックURLからの認証完了に失敗しました。'
+        err instanceof ApiError ? err.message : 'コードまたは URL の検証に失敗しました。'
       );
     } finally {
       setBusy(false);
@@ -793,11 +783,12 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
     setOAuthPendingState(null);
     setOAuthManualInput('');
     try {
-      await api.disconnectMcpOAuth(selectedServer.id);
+      const res = await api.disconnectMcpOAuth(selectedServer.id);
       await loadServers();
-      setStatusNote('OAuthトークンを削除しました。');
+      populateServerState(res.server, 'configure', { setupFlow: false, keepNotice: true });
+      setStatusNote('認証を解除しました。');
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'OAuth切断に失敗しました。');
+      setError(err instanceof ApiError ? err.message : '認証解除に失敗しました。');
     } finally {
       setBusy(false);
     }
@@ -815,15 +806,20 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
         overwrite: importOverwrite,
       });
       await loadServers();
-      if (res.imported.length > 0) {
-        populateFormFromServer(res.imported[0]);
+      const first = res.imported[0];
+      if (first) {
+        if (first.transport !== 'stdio' && first.authType === 'oauth' && first.oauth?.status !== 'connected') {
+          populateServerState(first, 'auth', { setupFlow: true, keepNotice: true });
+        } else {
+          await transitionToConfigureWithToolDiscovery(first, { setupFlow: false });
+        }
       } else {
-        setEditorMode('idle');
+        setViewMode('idle');
       }
       const skippedMsg = res.skipped.length > 0 ? `（スキップ: ${res.skipped.join(', ')}）` : '';
-      setStatusNote(`${res.imported.length} 件のMCPサーバーをインポートしました${skippedMsg}。`);
+      setStatusNote(`${res.imported.length} 件を取り込みました${skippedMsg}。`);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'JSONインポートに失敗しました。');
+      setError(err instanceof ApiError ? err.message : 'JSON の取り込みに失敗しました。');
     } finally {
       setBusy(false);
     }
@@ -832,926 +828,1263 @@ export const McpModal: React.FC<McpModalProps> = ({ onClose }) => {
   const copyCallbackUrl = async () => {
     try {
       await navigator.clipboard.writeText(callbackUrl);
-      setStatusNote('コールバックURLをコピーしました。');
+      setStatusNote('コールバック URL をコピーしました。');
     } catch {
       setStatusNote(callbackUrl);
     }
   };
 
-  return (
-    <ModalDialog label="MCP サーバー管理" size="modal-xl" onClose={onClose}>
-        <div className="modal-head">
-          <div className="modal-head-title-wrap">
-            <h3>MCP サーバー管理（管理者専用）</h3>
-            <p className="muted-xs" style={{ marginTop: 2 }}>
-              リモート（OAuth / APIキー / Bearer / ヘッダー）およびローカル（stdio）MCPをネイティブACP経由で接続します
-            </p>
+  // Unified tool list for Configure view
+  const mergedTools = useMemo(() => {
+    const map = new Map<string, McpDiscoveredTool>();
+    for (const t of discoveredTools) {
+      map.set(t.name, t);
+    }
+    for (const nameItem of [...allowedTools, ...disabledTools, ...alwaysAllowTools]) {
+      if (!map.has(nameItem)) {
+        map.set(nameItem, { name: nameItem });
+      }
+    }
+    return [...map.values()];
+  }, [discoveredTools, allowedTools, disabledTools, alwaysAllowTools]);
+
+  const isToolEnabled = useCallback(
+    (toolName: string): boolean => {
+      if (disabledTools.includes(toolName)) return false;
+      if (allowedTools.length > 0) return allowedTools.includes(toolName);
+      return true;
+    },
+    [allowedTools, disabledTools]
+  );
+
+  const persistToolPolicies = async (
+    nextAllowed: string[],
+    nextDisabled: string[],
+    nextAlwaysAllow: string[],
+    savingKey: string
+  ) => {
+    if (!selectedServer) return;
+    const prevAllowed = allowedTools;
+    const prevDisabled = disabledTools;
+    const prevAlways = alwaysAllowTools;
+
+    setAllowedTools(nextAllowed);
+    setDisabledTools(nextDisabled);
+    setAlwaysAllowTools(nextAlwaysAllow);
+    setToolSavingName(savingKey);
+    setError(null);
+    try {
+      const res = await api.updateMcpServer(selectedServer.id, {
+        allowedTools: nextAllowed,
+        disabledTools: nextDisabled,
+        alwaysAllowTools: nextAlwaysAllow,
+      });
+      setServers((prev) => prev.map((s) => (s.id === res.server.id ? res.server : s)));
+      setAllowedTools(res.server.allowedTools);
+      setDisabledTools(res.server.disabledTools);
+      setAlwaysAllowTools(res.server.alwaysAllowTools);
+    } catch (err) {
+      setAllowedTools(prevAllowed);
+      setDisabledTools(prevDisabled);
+      setAlwaysAllowTools(prevAlways);
+      setError(err instanceof ApiError ? err.message : 'ツール設定の更新に失敗しました。');
+    } finally {
+      setToolSavingName(null);
+    }
+  };
+
+  const handleToggleToolEnabled = (toolName: string, nextEnabled: boolean) => {
+    const allNames = mergedTools.map((t) => t.name);
+    let nextAllowed = [...allowedTools];
+    let nextDisabled = [...disabledTools];
+    let nextAlways = [...alwaysAllowTools];
+
+    if (discoveredTools.length > 0) {
+      // Transition cleanly from legacy allowedTools-only restriction to explicit disabledTools list
+      const currentlyEnabled = new Set(allNames.filter((n) => isToolEnabled(n)));
+      if (nextEnabled) currentlyEnabled.add(toolName);
+      else currentlyEnabled.delete(toolName);
+      nextAllowed = [];
+      nextDisabled = allNames.filter((n) => !currentlyEnabled.has(n));
+    } else {
+      if (nextEnabled) {
+        nextDisabled = nextDisabled.filter((n) => n !== toolName);
+        if (nextAllowed.length > 0 && !nextAllowed.includes(toolName)) {
+          nextAllowed.push(toolName);
+        }
+      } else {
+        if (!nextDisabled.includes(toolName)) nextDisabled.push(toolName);
+        nextAllowed = nextAllowed.filter((n) => n !== toolName);
+      }
+    }
+
+    if (!nextEnabled) {
+      nextAlways = nextAlways.filter((n) => n !== toolName);
+    }
+
+    void persistToolPolicies(nextAllowed, nextDisabled, nextAlways, toolName);
+  };
+
+  const handleSetToolPolicy = (toolName: string, policy: 'ask' | 'always') => {
+    const nextAlways =
+      policy === 'always'
+        ? alwaysAllowTools.includes(toolName)
+          ? alwaysAllowTools
+          : [...alwaysAllowTools, toolName]
+        : alwaysAllowTools.filter((n) => n !== toolName);
+    void persistToolPolicies(allowedTools, disabledTools, nextAlways, toolName);
+  };
+
+  const handleEnableAllTools = () => {
+    void persistToolPolicies([], [], alwaysAllowTools, '__bulk__');
+  };
+
+  const handleResetAllToAsk = () => {
+    void persistToolPolicies(allowedTools, disabledTools, [], '__bulk__');
+  };
+
+  const handleAddManualTools = () => {
+    const tokens = toolInputDraft
+      .split(/[,\s]+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    if (tokens.length === 0) return;
+
+    const nextDisabled = disabledTools.filter((n) => !tokens.includes(n));
+    let nextAllowed = [...allowedTools];
+    if (discoveredTools.length === 0) {
+      const seen = new Set(nextAllowed);
+      for (const tok of tokens) {
+        if (!seen.has(tok)) {
+          seen.add(tok);
+          nextAllowed.push(tok);
+        }
+      }
+    } else {
+      nextAllowed = [];
+      // Keep manual tools visible even if not in discoveredTools by updating local state + allowedTools if needed
+      setDiscoveredTools((prev) => {
+        const next = [...prev];
+        for (const tok of tokens) {
+          if (!next.some((t) => t.name === tok)) next.push({ name: tok });
+        }
+        return next;
+      });
+    }
+    setToolInputDraft('');
+    void persistToolPolicies(nextAllowed, nextDisabled, alwaysAllowTools, '__bulk__');
+  };
+
+  const toggleToolDescription = (toolName: string) => {
+    setExpandedToolDescs((prev) => ({
+      ...prev,
+      [toolName]: !prev[toolName],
+    }));
+  };
+
+  const enabledToolsCount = useMemo(
+    () => mergedTools.filter((t) => isToolEnabled(t.name)).length,
+    [mergedTools, isToolEnabled]
+  );
+  const effectiveAlwaysCount = useMemo(
+    () => mergedTools.filter((t) => isToolEnabled(t.name) && alwaysAllowTools.includes(t.name)).length,
+    [mergedTools, isToolEnabled, alwaysAllowTools]
+  );
+
+  const renderConnectionFields = (idPrefix: string, includeDescription: boolean) => (
+    <>
+      <div className="mcp-grid-2">
+        <div className="form-group">
+          <label htmlFor={`${idPrefix}-name`}>サーバー名 *</label>
+          <input
+            id={`${idPrefix}-name`}
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="例: linear / github"
+            pattern="^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$"
+            required
+          />
+        </div>
+
+        <div className="form-group">
+          <label htmlFor={`${idPrefix}-transport`}>接続方法</label>
+          <select
+            id={`${idPrefix}-transport`}
+            value={transport}
+            onChange={(e) => {
+              const next = e.target.value as McpTransport;
+              setTransport(next);
+              if (next === 'stdio') setAuthType('none');
+              else if (authType === 'none' && transport === 'stdio') setAuthType('oauth');
+            }}
+          >
+            <option value="http">{TRANSPORT_LABELS.http}</option>
+            <option value="sse">{TRANSPORT_LABELS.sse}</option>
+            <option value="stdio">{TRANSPORT_LABELS.stdio}</option>
+          </select>
+        </div>
+      </div>
+
+      {includeDescription && (
+        <div className="form-group">
+          <label htmlFor={`${idPrefix}-desc`}>メモ（任意）</label>
+          <input
+            id={`${idPrefix}-desc`}
+            type="text"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="用途や補足"
+          />
+        </div>
+      )}
+
+      {transport === 'stdio' ? (
+        <>
+          <div className="form-group">
+            <label htmlFor={`${idPrefix}-cmd`}>コマンド *</label>
+            <input
+              id={`${idPrefix}-cmd`}
+              type="text"
+              value={command}
+              onChange={(e) => setCommand(e.target.value)}
+              placeholder="例: npx / uvx / node"
+              required
+            />
           </div>
-          <button type="button" className="icon-btn" onClick={onClose} aria-label="閉じる">
-            <CloseIcon size={18} />
-          </button>
-        </div>
 
-        <div className="skills-scope-tabs" role="tablist" aria-label="MCP適用スコープ">
-          {(['shared', 'profile'] as McpScope[]).map((sc) => {
-            const count = servers.filter((s) => s.scope === sc).length;
-            return (
-              <button
-                key={sc}
-                type="button"
-                role="tab"
-                aria-selected={scopeTab === sc}
-                className={`skills-scope-tab ${scopeTab === sc ? 'active' : ''}`}
-                onClick={() => {
-                  setScopeTab(sc);
-                  setSelectedId(null);
-                  setEditorMode('idle');
-                  setTestResult(null);
-                  setOAuthPendingUrl(null);
-                  setError(null);
-                  setStatusNote(null);
-                  setMobileShowEditor(false);
-                }}
-              >
-                <span>{SCOPE_LABELS[sc]}</span>
-                <span className="skills-tab-count">{count}</span>
-              </button>
-            );
-          })}
-        </div>
+          <div className="form-group">
+            <label htmlFor={`${idPrefix}-args`}>引数（1行に1つ）</label>
+            <textarea
+              id={`${idPrefix}-args`}
+              rows={3}
+              value={argsText}
+              onChange={(e) => setArgsText(e.target.value)}
+              placeholder={'-y\n@modelcontextprotocol/server-filesystem\n/path/to/dir'}
+            />
+          </div>
 
-        <div className={`skills-body ${mobileShowEditor ? 'mobile-editor' : ''}`}>
-          {/* Left pane: Server list */}
-          <div className="skills-list-pane">
-            <div className="skills-list-toolbar">
-              <button
-                type="button"
-                className="btn btn-primary btn-xs"
-                onClick={() => openNewForm('http')}
-              >
-                <PlusIcon size={13} /> 新規追加
-              </button>
+          <div className="form-group">
+            <div className="mcp-kv-header">
+              <span className="mcp-kv-label">環境変数</span>
               <button
                 type="button"
                 className="btn btn-secondary btn-xs"
-                onClick={openImportForm}
+                onClick={() =>
+                  setEnvRows((prev) => [
+                    ...prev,
+                    { id: uid(), name: '', value: '', keepExisting: false },
+                  ])
+                }
               >
-                JSON取込
+                <PlusIcon size={12} /> 追加
               </button>
             </div>
-
-            <div className="muted-xs" style={{ padding: '0 12px 8px' }}>
-              {scopeTab === 'shared'
-                ? '全ユーザーのチャットセッションに自動で接続されます（認証情報はサーバー側で暗号化管理）。'
-                : '管理者であるご自身のプロファイルのチャットセッションにのみ接続されます。'}
+            {envRows.map((row) => (
+              <div key={row.id} className="mcp-kv-row">
+                <input
+                  type="text"
+                  value={row.name}
+                  onChange={(e) =>
+                    setEnvRows((prev) =>
+                      prev.map((r) => (r.id === row.id ? { ...r, name: e.target.value } : r))
+                    )
+                  }
+                  placeholder="変数名"
+                  aria-label="環境変数名"
+                />
+                <input
+                  type="password"
+                  value={row.value}
+                  onChange={(e) =>
+                    setEnvRows((prev) =>
+                      prev.map((r) =>
+                        r.id === row.id
+                          ? { ...r, value: e.target.value, keepExisting: false }
+                          : r
+                      )
+                    )
+                  }
+                  placeholder={row.keepExisting ? `設定済 (${row.maskedValue}) — 変更時のみ入力` : '値'}
+                  aria-label="環境変数の値"
+                />
+                <button
+                  type="button"
+                  className="icon-btn"
+                  aria-label="環境変数を削除"
+                  onClick={() => setEnvRows((prev) => prev.filter((r) => r.id !== row.id))}
+                >
+                  <TrashIcon size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="mcp-grid-2">
+            <div className="form-group">
+              <label htmlFor={`${idPrefix}-url`}>サーバー URL *</label>
+              <input
+                id={`${idPrefix}-url`}
+                type="url"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                placeholder="https://mcp.example.com/mcp"
+                required
+              />
             </div>
 
-            {loading ? (
-              <div className="muted-xs" style={{ padding: 16 }}>読み込み中...</div>
-            ) : listError ? (
-              <div className="error-box" role="alert" style={{ margin: '0 12px 12px' }}>
-                <div>{listError}</div>
+            <div className="form-group">
+              <label htmlFor={`${idPrefix}-auth`}>認証方法</label>
+              <select
+                id={`${idPrefix}-auth`}
+                value={authType}
+                onChange={(e) => setAuthType(e.target.value as McpAuthType)}
+              >
+                <option value="oauth">{AUTH_LABELS.oauth}</option>
+                <option value="bearer">{AUTH_LABELS.bearer}</option>
+                <option value="api_key">{AUTH_LABELS.api_key}</option>
+                <option value="headers">{AUTH_LABELS.headers}</option>
+                <option value="none">{AUTH_LABELS.none}</option>
+              </select>
+            </div>
+          </div>
+
+          {authType === 'bearer' && (
+            <div className="form-group">
+              <label htmlFor={`${idPrefix}-bearer`}>Bearer トークン</label>
+              <input
+                id={`${idPrefix}-bearer`}
+                type="password"
+                value={bearerToken}
+                onChange={(e) => {
+                  setBearerToken(e.target.value);
+                  if (e.target.value) setKeepExistingBearer(false);
+                }}
+                placeholder={keepExistingBearer ? `設定済 (${existingBearerMask}) — 変更時のみ入力` : 'トークンを入力'}
+              />
+            </div>
+          )}
+
+          {authType === 'api_key' && (
+            <div className="mcp-grid-2">
+              <div className="form-group">
+                <label htmlFor={`${idPrefix}-apikey-name`}>ヘッダー名</label>
+                <input
+                  id={`${idPrefix}-apikey-name`}
+                  type="text"
+                  value={apiKeyHeaderName}
+                  onChange={(e) => setApiKeyHeaderName(e.target.value)}
+                  placeholder="X-API-Key"
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor={`${idPrefix}-apikey-val`}>API キー</label>
+                <input
+                  id={`${idPrefix}-apikey-val`}
+                  type="password"
+                  value={apiKeyValue}
+                  onChange={(e) => {
+                    setApiKeyValue(e.target.value);
+                    if (e.target.value) setKeepExistingApiKey(false);
+                  }}
+                  placeholder={keepExistingApiKey ? `設定済 (${existingApiKeyMask}) — 変更時のみ入力` : 'API キーを入力'}
+                />
+              </div>
+            </div>
+          )}
+
+          {(authType === 'headers' || authType === 'bearer' || authType === 'api_key') && (
+            <div className="form-group">
+              <div className="mcp-kv-header">
+                <span className="mcp-kv-label">
+                  {authType === 'headers' ? 'HTTP ヘッダー' : '追加ヘッダー（任意）'}
+                </span>
                 <button
                   type="button"
                   className="btn btn-secondary btn-xs"
-                  style={{ marginTop: 8 }}
-                  onClick={() => void loadServers()}
+                  onClick={() =>
+                    setHeaderRows((prev) => [
+                      ...prev,
+                      { id: uid(), name: '', value: '', keepExisting: false },
+                    ])
+                  }
                 >
-                  再読み込み
+                  <PlusIcon size={12} /> 追加
                 </button>
               </div>
-            ) : filteredServers.length === 0 ? (
-              <div className="skills-empty-list">
-                <p className="muted-xs">このスコープにMCPサーバーはまだありません。</p>
-                <div className="row-actions" style={{ justifyContent: 'center', marginTop: 8 }}>
+              {headerRows.map((row) => (
+                <div key={row.id} className="mcp-kv-row">
+                  <input
+                    type="text"
+                    value={row.name}
+                    onChange={(e) =>
+                      setHeaderRows((prev) =>
+                        prev.map((r) => (r.id === row.id ? { ...r, name: e.target.value } : r))
+                      )
+                    }
+                    placeholder="ヘッダー名"
+                    aria-label="HTTPヘッダー名"
+                  />
+                  <input
+                    type="password"
+                    value={row.value}
+                    onChange={(e) =>
+                      setHeaderRows((prev) =>
+                        prev.map((r) =>
+                          r.id === row.id
+                            ? { ...r, value: e.target.value, keepExisting: false }
+                            : r
+                        )
+                      )
+                    }
+                    placeholder={row.keepExisting ? `設定済 (${row.maskedValue}) — 変更時のみ入力` : '値'}
+                    aria-label="HTTPヘッダー値"
+                  />
                   <button
                     type="button"
-                    className="btn btn-secondary btn-xs"
-                    onClick={() => openNewForm('http')}
+                    className="icon-btn"
+                    aria-label="ヘッダーを削除"
+                    onClick={() => setHeaderRows((prev) => prev.filter((r) => r.id !== row.id))}
                   >
-                    リモートMCPを追加
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-xs"
-                    onClick={() => openNewForm('stdio')}
-                  >
-                    ローカルMCPを追加
+                    <TrashIcon size={14} />
                   </button>
                 </div>
+              ))}
+            </div>
+          )}
+
+          {authType === 'oauth' && (
+            <details className="mcp-oauth-disclosure">
+              <summary>OAuth クライアント情報（必要な場合のみ）</summary>
+              <div className="mcp-oauth-advanced">
+                <p className="muted-xs" style={{ margin: 0 }}>
+                  通常は空欄のまま自動で設定されます。手動登録が必要な場合のみ入力してください。
+                </p>
+                <div className="mcp-grid-2">
+                  <div className="form-group">
+                    <label htmlFor={`${idPrefix}-oauth-cid`}>Client ID</label>
+                    <input
+                      id={`${idPrefix}-oauth-cid`}
+                      type="text"
+                      value={oauthClientId}
+                      onChange={(e) => setOAuthClientId(e.target.value)}
+                      placeholder="自動取得"
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label htmlFor={`${idPrefix}-oauth-csec`}>Client Secret</label>
+                    <input
+                      id={`${idPrefix}-oauth-csec`}
+                      type="password"
+                      value={oauthClientSecret}
+                      onChange={(e) => {
+                        setOAuthClientSecret(e.target.value);
+                        if (e.target.value) setClearClientSecret(false);
+                      }}
+                      placeholder={selectedServer?.oauth?.hasClientSecret ? '設定済 — 変更時のみ入力' : '任意'}
+                    />
+                  </div>
+                </div>
+                <div className="mcp-grid-2">
+                  <div className="form-group">
+                    <label htmlFor={`${idPrefix}-oauth-authurl`}>Authorization URL</label>
+                    <input
+                      id={`${idPrefix}-oauth-authurl`}
+                      type="url"
+                      value={oauthAuthUrl}
+                      onChange={(e) => setOAuthAuthUrl(e.target.value)}
+                      placeholder="自動取得"
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label htmlFor={`${idPrefix}-oauth-tokurl`}>Token URL</label>
+                    <input
+                      id={`${idPrefix}-oauth-tokurl`}
+                      type="url"
+                      value={oauthTokenUrl}
+                      onChange={(e) => setOAuthTokenUrl(e.target.value)}
+                      placeholder="自動取得"
+                    />
+                  </div>
+                </div>
+                <div className="form-group">
+                  <label htmlFor={`${idPrefix}-oauth-scopes`}>スコープ</label>
+                  <input
+                    id={`${idPrefix}-oauth-scopes`}
+                    type="text"
+                    value={oauthScopes}
+                    onChange={(e) => setOAuthScopes(e.target.value)}
+                    placeholder="例: mcp:tools"
+                  />
+                </div>
+                <div className="form-group">
+                  <label htmlFor={`${idPrefix}-oauth-extra`}>追加パラメータ（key=value）</label>
+                  <textarea
+                    id={`${idPrefix}-oauth-extra`}
+                    rows={2}
+                    value={oauthExtraParamsText}
+                    onChange={(e) => setOAuthExtraParamsText(e.target.value)}
+                    placeholder="resource=https://example.com"
+                  />
+                </div>
               </div>
-            ) : (
-              <div className="skills-list">
-                {filteredServers.map((srv) => {
-                  const badge = formatOAuthBadge(srv);
-                  const isSelected = selectedId === srv.id && editorMode === 'edit';
-                  return (
-                    <div
-                      key={srv.id}
-                      className={`skill-list-item ${isSelected ? 'selected' : ''} ${!srv.enabled ? 'disabled' : ''}`}
-                    >
-                      <button
-                        type="button"
-                        className="skill-list-item-btn"
-                        aria-current={isSelected ? 'true' : undefined}
-                        onClick={() => populateFormFromServer(srv)}
-                      >
-                        <div className="skill-list-main">
-                          <div className="skill-list-title">
-                            <strong>{srv.name}</strong>
-                            <span className="mcp-badge mcp-badge-transport">{srv.transport.toUpperCase()}</span>
-                            <span className={`mcp-badge mcp-badge-${badge.tone}`}>{badge.label}</span>
-                            {srv.allowedTools.length > 0 && (
-                              <span className="mcp-badge mcp-badge-muted">ツール {srv.allowedTools.length}件のみ</span>
-                            )}
-                          </div>
-                          <div className="muted-xs skill-list-desc">
-                            {srv.description || (srv.transport === 'stdio' ? srv.command : srv.url) || ''}
-                          </div>
-                        </div>
-                      </button>
-                      <div className="skill-list-toggle">
-                        <ToggleSwitch
-                          checked={srv.enabled}
-                          label=""
-                          ariaLabel={`MCPサーバー「${srv.name}」を有効にする`}
-                          onChange={(next) => void handleToggleEnabled(srv, next)}
-                        />
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+            </details>
+          )}
+        </>
+      )}
+    </>
+  );
+
+  return (
+    <ModalDialog label="MCP サーバー" size="modal-xl" onClose={onClose}>
+      <div className="modal-head">
+        <div className="modal-head-title-wrap">
+          <h3>MCP サーバー</h3>
+          <p className="muted-xs" style={{ marginTop: 2 }}>
+            外部ツールやサービスをチャットに接続します
+          </p>
+        </div>
+        <button type="button" className="icon-btn" onClick={onClose} aria-label="閉じる">
+          <CloseIcon size={18} />
+        </button>
+      </div>
+
+      <div className="skills-scope-tabs" role="tablist" aria-label="適用範囲">
+        {(['shared', 'profile'] as McpScope[]).map((sc) => {
+          const count = servers.filter((s) => s.scope === sc).length;
+          return (
+            <button
+              key={sc}
+              type="button"
+              role="tab"
+              aria-selected={scopeTab === sc}
+              className={`skills-scope-tab ${scopeTab === sc ? 'active' : ''}`}
+              onClick={() => {
+                setScopeTab(sc);
+                setSelectedId(null);
+                setViewMode('idle');
+                setIsSetupFlow(false);
+                setTestResult(null);
+                setOAuthPendingUrl(null);
+                setError(null);
+                setStatusNote(null);
+                setMobileShowEditor(false);
+              }}
+            >
+              <span>{SCOPE_LABELS[sc]}</span>
+              <span className="skills-tab-count">{count}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className={`skills-body ${mobileShowEditor ? 'mobile-editor' : ''}`}>
+        {/* Left pane: Server list */}
+        <div className="skills-list-pane">
+          <div className="skills-list-toolbar">
+            <button
+              type="button"
+              className="btn btn-primary btn-xs"
+              onClick={() => openConnectScreen('http')}
+            >
+              <PlusIcon size={13} /> サーバーを追加
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary btn-xs"
+              onClick={openImportForm}
+            >
+              JSON 取込
+            </button>
           </div>
 
-          {/* Right pane: Editor / Import / Idle */}
-          <div className="skills-editor-pane">
-            {mobileShowEditor && (
-              <div className="skills-mobile-back mcp-mobile-back">
+          <div className="muted-xs" style={{ padding: '0 12px 8px' }}>
+            {scopeTab === 'shared'
+              ? '全ユーザーのチャットで利用できるサーバーを管理します。'
+              : '自分のアカウントのチャットでのみ利用できるサーバーを管理します。'}
+          </div>
+
+          {loading ? (
+            <div className="muted-xs" style={{ padding: 16 }}>読み込み中...</div>
+          ) : listError ? (
+            <div className="error-box" role="alert" style={{ margin: '0 12px 12px' }}>
+              <div>{listError}</div>
+              <button
+                type="button"
+                className="btn btn-secondary btn-xs"
+                style={{ marginTop: 8 }}
+                onClick={() => void loadServers()}
+              >
+                再読み込み
+              </button>
+            </div>
+          ) : filteredServers.length === 0 ? (
+            <div className="skills-empty-list">
+              <p className="muted-xs">登録されたサーバーはありません。</p>
+              <div className="row-actions" style={{ justifyContent: 'center', marginTop: 8 }}>
                 <button
                   type="button"
-                  className="btn btn-secondary btn-xs mobile-back-btn"
-                  onClick={() => setMobileShowEditor(false)}
+                  className="btn btn-secondary btn-xs"
+                  onClick={() => openConnectScreen('http')}
                 >
-                  ← 一覧へ戻る
+                  サーバーを接続
                 </button>
               </div>
-            )}
+            </div>
+          ) : (
+            <div className="skills-list">
+              {filteredServers.map((srv) => {
+                const badge = formatServerStatusBadge(srv);
+                const isSelected = selectedId === srv.id && (viewMode === 'configure' || viewMode === 'auth');
+                return (
+                  <div
+                    key={srv.id}
+                    className={`skill-list-item ${isSelected ? 'selected' : ''} ${!srv.enabled ? 'disabled' : ''}`}
+                  >
+                    <button
+                      type="button"
+                      className="skill-list-item-btn"
+                      aria-current={isSelected ? 'true' : undefined}
+                      onClick={() => {
+                        const targetView =
+                          srv.transport !== 'stdio' &&
+                          srv.authType === 'oauth' &&
+                          srv.oauth?.status !== 'connected'
+                            ? 'auth'
+                            : 'configure';
+                        populateServerState(srv, targetView, { setupFlow: false });
+                      }}
+                    >
+                      <div className="skill-list-main">
+                        <div className="skill-list-title">
+                          <strong>{srv.name}</strong>
+                          <span className="mcp-badge mcp-badge-transport">{srv.transport.toUpperCase()}</span>
+                          <span className={`mcp-badge mcp-badge-${badge.tone}`}>{badge.label}</span>
+                        </div>
+                        <div className="muted-xs skill-list-desc">
+                          {srv.description || (srv.transport === 'stdio' ? srv.command : srv.url) || ''}
+                        </div>
+                      </div>
+                    </button>
+                    <div className="skill-list-toggle">
+                      <ToggleSwitch
+                        checked={srv.enabled}
+                        label=""
+                        ariaLabel={`${srv.name} を有効にする`}
+                        onChange={(next) => void handleToggleEnabled(srv, next)}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
 
-            {error && <div className="error-box" role="alert" style={{ marginBottom: 12 }}>{error}</div>}
-            {statusNote && (
-              <div className="success-box" role="status" style={{ marginBottom: 12 }}>
-                <div>{statusNote}</div>
-                {oauthPendingUrl && (
-                  <div style={{ marginTop: 8 }}>
+        {/* Right pane */}
+        <div className="skills-editor-pane">
+          {mobileShowEditor && (
+            <div className="skills-mobile-back mcp-mobile-back">
+              <button
+                type="button"
+                className="btn btn-secondary btn-xs mobile-back-btn"
+                onClick={() => setMobileShowEditor(false)}
+              >
+                ← 一覧へ戻る
+              </button>
+            </div>
+          )}
+
+          {error && <div className="error-box" role="alert" style={{ marginBottom: 12 }}>{error}</div>}
+          {statusNote && (
+            <div className="success-box" role="status" style={{ marginBottom: 12 }}>
+              <div>{statusNote}</div>
+            </div>
+          )}
+
+          {viewMode === 'idle' && (
+            <div className="skills-editor-idle">
+              <h4>MCP サーバーを追加または選択</h4>
+              <p className="muted-xs">
+                「共有」は全ユーザーに適用され、「個人」は自分のアカウントのみに適用されます。
+              </p>
+              <div className="row-actions" style={{ marginTop: 14, flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  onClick={() => openConnectScreen('http')}
+                >
+                  <PlusIcon size={14} /> 新しいサーバーを接続
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  onClick={openImportForm}
+                >
+                  JSON から取り込む
+                </button>
+              </div>
+            </div>
+          )}
+
+          {viewMode === 'import' && (
+            <form onSubmit={handleImportJson} className="mcp-form">
+              <h4>JSON から追加（{SCOPE_LABELS[scopeTab]}）</h4>
+              <p className="muted-xs">
+                <code>mcpServers</code> 形式の設定 JSON を貼り付けてまとめて登録できます。
+              </p>
+
+              <div className="form-group">
+                <label htmlFor="mcp-import-json">JSON 設定</label>
+                <textarea
+                  id="mcp-import-json"
+                  rows={10}
+                  value={importJsonText}
+                  onChange={(e) => setImportJsonText(e.target.value)}
+                  placeholder={`{\n  "mcpServers": {\n    "linear": {\n      "url": "https://mcp.linear.app/mcp"\n    }\n  }\n}`}
+                  required
+                />
+              </div>
+
+              <ToggleSwitch
+                checked={importOverwrite}
+                label="同名のサーバーがある場合は上書きする"
+                onChange={setImportOverwrite}
+              />
+
+              <div className="row-actions mcp-form-actions" style={{ marginTop: 10 }}>
+                <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
+                  取り込む
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => {
+                    setViewMode('idle');
+                    setMobileShowEditor(false);
+                  }}
+                >
+                  キャンセル
+                </button>
+              </div>
+            </form>
+          )}
+
+          {/* Step 1: Connect Screen — ONLY connection essentials */}
+          {viewMode === 'connect' && (
+            <form onSubmit={handleConnectSubmit} className="mcp-form">
+              <div className="mcp-stepper" aria-label="設定手順">
+                <span className="mcp-step is-active">1. 接続情報</span>
+                {transport !== 'stdio' && authType === 'oauth' && (
+                  <>
+                    <span className="mcp-step-sep">→</span>
+                    <span className="mcp-step">2. 認証</span>
+                  </>
+                )}
+                <span className="mcp-step-sep">→</span>
+                <span className="mcp-step">
+                  {transport !== 'stdio' && authType === 'oauth' ? '3. ツール設定' : '2. ツール設定'}
+                </span>
+              </div>
+
+              <div className="mcp-form-header">
+                <h4>サーバーを接続（{SCOPE_LABELS[scopeTab]}）</h4>
+              </div>
+
+              {renderConnectionFields('mcp-connect', false)}
+
+              <div className="row-actions mcp-form-actions" style={{ marginTop: 6 }}>
+                <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
+                  {busy
+                    ? '処理中...'
+                    : transport !== 'stdio' && authType === 'oauth'
+                      ? '次へ：認証へ進む'
+                      : '接続してツール設定へ'}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => {
+                    setViewMode('idle');
+                    setMobileShowEditor(false);
+                  }}
+                >
+                  キャンセル
+                </button>
+              </div>
+            </form>
+          )}
+
+          {/* Step 2: Dedicated Auth UI (OAuth) */}
+          {viewMode === 'auth' && selectedServer && (
+            <div className="mcp-form">
+              {isSetupFlow && (
+                <div className="mcp-stepper" aria-label="設定手順">
+                  <span className="mcp-step is-done">
+                    <CheckIcon size={12} /> 1. 接続情報
+                  </span>
+                  <span className="mcp-step-sep">→</span>
+                  <span className="mcp-step is-active">2. 認証</span>
+                  <span className="mcp-step-sep">→</span>
+                  <span className="mcp-step">3. ツール設定</span>
+                </div>
+              )}
+
+              <div className="mcp-auth-card">
+                <div className="mcp-auth-card-head">
+                  <div>
+                    <div className="mcp-auth-title">
+                      <strong>{selectedServer.name}</strong>
+                      <span className="mcp-badge mcp-badge-transport">
+                        {selectedServer.transport.toUpperCase()}
+                      </span>
+                      <span className={`mcp-badge mcp-badge-${formatServerStatusBadge(selectedServer).tone}`}>
+                        {formatServerStatusBadge(selectedServer).label}
+                      </span>
+                    </div>
+                    {selectedServer.url && (
+                      <div className="muted-xs" style={{ marginTop: 4, wordBreak: 'break-all' }}>
+                        {selectedServer.url}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <p className="muted-sm" style={{ margin: 0 }}>
+                  {selectedServer.oauth?.status === 'connected'
+                    ? '認証は完了しています。ツール設定へ進むか、必要に応じて再認証できます。'
+                    : 'アカウントでログインして接続を許可してください。認証が完了するとツール設定へ進みます。'}
+                </p>
+
+                {selectedServer.oauth?.error && (
+                  <div className="error-box" role="alert">
+                    {selectedServer.oauth.error}
+                  </div>
+                )}
+
+                <div className="row-actions" style={{ flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-sm"
+                    disabled={busy}
+                    onClick={() => void handleStartOAuth()}
+                  >
+                    <ExternalLinkIcon size={14} />
+                    <span>
+                      {selectedServer.oauth?.status === 'connected' ? '再認証する' : '認証ページを開く'}
+                    </span>
+                  </button>
+
+                  {oauthPendingUrl && (
                     <a
                       href={oauthPendingUrl}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="btn btn-primary btn-xs"
+                      className="btn btn-secondary btn-sm"
                     >
-                      <span>認証ページを開く</span>
-                      <ExternalLinkIcon size={12} />
+                      <span>ページをもう一度開く</span>
+                      <ExternalLinkIcon size={13} />
                     </a>
-                  </div>
-                )}
-              </div>
-            )}
+                  )}
 
-            {editorMode === 'idle' && (
-              <div className="skills-editor-idle">
-                <h4>MCP サーバーを選択または追加</h4>
-                <p className="muted-xs">
-                  「全プロファイル共有」に追加したMCPは全ユーザーへ、「自プロファイルのみ」に追加したMCPは管理者自身のみへ適用されます。
-                  認証シークレットやOAuthトークンは暗号化して保存され、他ユーザーのホームディレクトリには書き込まれません。
-                </p>
-                <div className="row-actions" style={{ marginTop: 12, flexWrap: 'wrap' }}>
-                  <button
-                    type="button"
-                    className="btn btn-primary btn-sm"
-                    onClick={() => openNewForm('http')}
-                  >
-                    <PlusIcon size={14} /> リモートMCPを追加
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-sm"
-                    onClick={() => openNewForm('stdio')}
-                  >
-                    <PlusIcon size={14} /> ローカルMCPを追加
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-sm"
-                    onClick={openImportForm}
-                  >
-                    標準JSONからインポート
-                  </button>
+                  {selectedServer.oauth?.status === 'connected' && (
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      disabled={busy}
+                      onClick={() =>
+                        void transitionToConfigureWithToolDiscovery(selectedServer, {
+                          setupFlow: isSetupFlow,
+                        })
+                      }
+                    >
+                      ツール設定へ進む
+                    </button>
+                  )}
+                </div>
+
+                <div className="mcp-auth-manual">
+                  <label htmlFor="mcp-oauth-manual" className="mcp-kv-label">
+                    リダイレクト後の URL または認可コード（自動反映されない場合）
+                  </label>
+                  <div className="mcp-tools-add-row">
+                    <input
+                      id="mcp-oauth-manual"
+                      type="text"
+                      value={oauthManualInput}
+                      onChange={(e) => setOAuthManualInput(e.target.value)}
+                      placeholder="https://... または code を貼り付け"
+                    />
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      disabled={busy || !oauthManualInput.trim()}
+                      onClick={() => void handleCompleteOAuthManual()}
+                    >
+                      認証を完了
+                    </button>
+                  </div>
                 </div>
               </div>
-            )}
 
-            {editorMode === 'import' && (
-              <form onSubmit={handleImportJson} className="mcp-form">
-                <h4>標準 MCP JSON からインポート（{SCOPE_LABELS[scopeTab]}）</h4>
-                <p className="muted-xs">
-                  Claude Desktop / Cursor / Antigravity / VS Code などの <code>mcpServers</code> JSON をそのまま貼り付けて登録できます（リモート <code>url</code> / <code>serverUrl</code>、ローカル <code>command</code>、<code>enabledTools</code> 対応）。
-                </p>
+              <details className="mcp-oauth-disclosure">
+                <summary>接続先・クライアント詳細を編集</summary>
+                <form onSubmit={handleSaveConnectionSettings} className="mcp-oauth-advanced">
+                  <div className="mcp-callback-row" style={{ marginTop: 0 }}>
+                    <span className="mcp-kv-label">コールバック URL</span>
+                    <div className="mcp-callback-copy">
+                      <code>{callbackUrl}</code>
+                      <button type="button" className="btn btn-secondary btn-xs" onClick={copyCallbackUrl}>
+                        コピー
+                      </button>
+                    </div>
+                  </div>
+                  {renderConnectionFields('mcp-auth-edit', false)}
+                  <div className="row-actions">
+                    <button type="submit" className="btn btn-secondary btn-sm" disabled={busy}>
+                      設定を保存
+                    </button>
+                  </div>
+                </form>
+              </details>
 
-                <div className="form-group">
-                  <label htmlFor="mcp-import-json">MCP 設定 JSON</label>
-                  <textarea
-                    id="mcp-import-json"
-                    rows={11}
-                    value={importJsonText}
-                    onChange={(e) => setImportJsonText(e.target.value)}
-                    placeholder={`{\n  "mcpServers": {\n    "github": {\n      "command": "npx",\n      "args": ["-y", "@modelcontextprotocol/server-github"],\n      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_..." }\n    },\n    "linear": {\n      "url": "https://mcp.linear.app/mcp"\n    }\n  }\n}`}
-                    required
+              <div className="row-actions" style={{ justifyContent: 'space-between' }}>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  disabled={busy}
+                  onClick={() => populateServerState(selectedServer, 'configure', { setupFlow: false })}
+                >
+                  あとで認証して設定画面へ
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-danger-outline btn-sm"
+                  disabled={busy}
+                  onClick={() => void handleDelete()}
+                >
+                  削除
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Step 3: Post-Connection Settings UI (clearly separated from Connect screen) */}
+          {viewMode === 'configure' && selectedServer && (
+            <div className="mcp-form">
+              {isSetupFlow && (
+                <div className="mcp-stepper" aria-label="設定手順">
+                  <span className="mcp-step is-done">
+                    <CheckIcon size={12} /> 1. 接続情報
+                  </span>
+                  {selectedServer.transport !== 'stdio' && selectedServer.authType === 'oauth' && (
+                    <>
+                      <span className="mcp-step-sep">→</span>
+                      <span className="mcp-step is-done">
+                        <CheckIcon size={12} /> 2. 認証
+                      </span>
+                    </>
+                  )}
+                  <span className="mcp-step-sep">→</span>
+                  <span className="mcp-step is-active">
+                    {selectedServer.transport !== 'stdio' && selectedServer.authType === 'oauth'
+                      ? '3. ツール設定'
+                      : '2. ツール設定'}
+                  </span>
+                </div>
+              )}
+
+              {/* Server status & enablement header */}
+              <div className="mcp-config-header-card">
+                <div className="mcp-config-header-main">
+                  <div className="mcp-config-title-row">
+                    <h4>{selectedServer.name}</h4>
+                    <span className="mcp-badge mcp-badge-transport">
+                      {selectedServer.transport.toUpperCase()}
+                    </span>
+                    <span className={`mcp-badge mcp-badge-${formatServerStatusBadge(selectedServer).tone}`}>
+                      {formatServerStatusBadge(selectedServer).label}
+                    </span>
+                  </div>
+                  <div className="muted-xs" style={{ wordBreak: 'break-all' }}>
+                    {selectedServer.description ||
+                      (selectedServer.transport === 'stdio'
+                        ? [selectedServer.command, ...selectedServer.args].filter(Boolean).join(' ')
+                        : selectedServer.url) ||
+                      ''}
+                  </div>
+                </div>
+
+                <div className="mcp-config-header-actions">
+                  <ToggleSwitch
+                    checked={enabled}
+                    label={enabled ? '有効' : '無効'}
+                    ariaLabel={`${selectedServer.name} の有効・無効を切り替え`}
+                    onChange={(next) => void handleToggleEnabled(selectedServer, next)}
                   />
                 </div>
+              </div>
 
-                <ToggleSwitch
-                  checked={importOverwrite}
-                  label="同じスコープに同名のサーバーがある場合は上書きする"
-                  onChange={setImportOverwrite}
-                />
-
-                <div className="row-actions mcp-form-actions" style={{ marginTop: 14 }}>
-                  <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
-                    インポート実行
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-sm"
-                    onClick={() => {
-                      setEditorMode('idle');
-                      setMobileShowEditor(false);
-                    }}
-                  >
-                    キャンセル
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {(editorMode === 'new' || editorMode === 'edit') && (
-              <form onSubmit={handleSave} className="mcp-form">
-                <div className="mcp-form-header">
-                  <h4>
-                    {editorMode === 'new'
-                      ? `新規 MCP サーバー（${SCOPE_LABELS[scopeTab]}）`
-                      : `編集: ${selectedServer?.name ?? name}（${SCOPE_LABELS[selectedServer?.scope ?? scopeTab]}）`}
-                  </h4>
-                  {editorMode === 'edit' && selectedServer && (
-                    <div className="row-actions">
-                      <button
-                        type="button"
-                        className="btn btn-secondary btn-xs"
-                        onClick={() => void handleTest()}
-                        disabled={busy}
-                        title={
-                          isEditFormDirty
-                            ? '未保存の変更があります。先に「変更を保存」してからテストしてください'
-                            : '保存済みの設定で接続テストを実行'
-                        }
-                      >
-                        接続テスト
-                      </button>
+              <div className="row-actions mcp-config-toolbar">
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-xs"
+                  disabled={busy}
+                  onClick={() => void handleTestAndRefreshTools()}
+                >
+                  <RefreshIcon size={13} /> ツール一覧を更新
+                </button>
+                {selectedServer.transport !== 'stdio' && selectedServer.authType === 'oauth' && (
+                  <>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-xs"
+                      disabled={busy}
+                      onClick={() => populateServerState(selectedServer, 'auth', { setupFlow: false })}
+                    >
+                      {selectedServer.oauth?.status === 'connected' ? '再認証' : '認証する'}
+                    </button>
+                    {selectedServer.oauth?.status === 'connected' && (
                       <button
                         type="button"
                         className="btn btn-danger-outline btn-xs"
-                        onClick={() => void handleDelete()}
                         disabled={busy}
+                        onClick={() => void handleDisconnectOAuth()}
                       >
-                        <TrashIcon size={13} /> 削除
+                        認証解除
                       </button>
+                    )}
+                  </>
+                )}
+                <button
+                  type="button"
+                  className="btn btn-danger-outline btn-xs"
+                  style={{ marginLeft: 'auto' }}
+                  disabled={busy}
+                  onClick={() => void handleDelete()}
+                >
+                  <TrashIcon size={13} /> 削除
+                </button>
+              </div>
+
+              {testResult && !testResult.ok && (
+                <div className="error-box" role="alert">
+                  <div>{testResult.message}</div>
+                  {testResult.status === 'oauth_required' && selectedServer.authType !== 'oauth' && (
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-xs"
+                      style={{ marginTop: 8 }}
+                      disabled={busy}
+                      onClick={() => {
+                        void (async () => {
+                          setBusy(true);
+                          try {
+                            const updated = await api.updateMcpServer(selectedServer.id, { authType: 'oauth' });
+                            await loadServers();
+                            populateServerState(updated.server, 'auth', { setupFlow: true });
+                          } finally {
+                            setBusy(false);
+                          }
+                        })();
+                      }}
+                    >
+                      OAuth 認証に切り替える
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* Primary Section: Dynamic Tool List & Per-Tool Permissions */}
+              <section className="mcp-tools-panel" aria-label="ツール権限設定">
+                <div className="mcp-tools-panel-head">
+                  <div>
+                    <h5>ツールと実行許可</h5>
+                    <div className="muted-xs">
+                      {mergedTools.length > 0
+                        ? `有効 ${enabledToolsCount} / ${mergedTools.length} 件・常に許可 ${effectiveAlwaysCount} 件`
+                        : 'サーバーに接続すると利用可能なツールが表示されます'}
+                    </div>
+                  </div>
+                  {mergedTools.length > 0 && (
+                    <div className="row-actions">
+                      {enabledToolsCount < mergedTools.length && (
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-xs"
+                          disabled={toolSavingName !== null}
+                          onClick={handleEnableAllTools}
+                        >
+                          すべて有効
+                        </button>
+                      )}
+                      {effectiveAlwaysCount > 0 && (
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-xs"
+                          disabled={toolSavingName !== null}
+                          onClick={handleResetAllToAsk}
+                        >
+                          すべて確認に戻す
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
 
-                {editorMode === 'edit' && isEditFormDirty && (
-                  <div className="muted-xs mcp-dirty-hint" role="status">
-                    未保存の変更があります。接続テストを行う前に「変更を保存」してください。
-                  </div>
-                )}
-
-                {testResult && (
-                  <div
-                    className={testResult.ok ? 'success-box' : 'error-box'}
-                    role={testResult.ok ? 'status' : 'alert'}
-                    style={{ marginBottom: 12 }}
-                  >
-                    <div>{testResult.message}</div>
-                    {testResult.tools && testResult.tools.length > 0 && (
-                      <div className="muted-xs" style={{ marginTop: 4 }}>
-                        利用可能ツールを {testResult.tools.length} 件取得しました（「許可するツール」欄から選択できます）。
-                      </div>
-                    )}
-                    {testResult.discoveredOAuth?.authorizationUrl && (
-                      <div className="muted-xs" style={{ marginTop: 4 }}>
-                        OAuth エンドポイント検出済: {testResult.discoveredOAuth.authorizationUrl}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                <div className="form-group">
-                  <label htmlFor="mcp-name">サーバー名（英数字・._-）</label>
-                  <input
-                    id="mcp-name"
-                    type="text"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    placeholder="例: github, linear, google-drive"
-                    required
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label htmlFor="mcp-description">説明（任意）</label>
-                  <input
-                    id="mcp-description"
-                    type="text"
-                    value={description}
-                    onChange={(e) => setDescription(e.target.value)}
-                    placeholder="用途メモ（例: 社内Notion検索、GitHub Issue管理）"
-                  />
-                </div>
-
-                <div className="mcp-grid-2">
-                  <div className="form-group">
-                    <label htmlFor="mcp-transport">接続方式（トランスポート）</label>
-                    <select
-                      id="mcp-transport"
-                      value={transport}
-                      onChange={(e) => {
-                        const next = e.target.value as McpTransport;
-                        setTransport(next);
-                        if (next === 'stdio') setAuthType('none');
-                        else if (authType === 'none' && editorMode === 'new') setAuthType('oauth');
+                {mergedTools.length === 0 ? (
+                  <div className="empty-box">
+                    <p className="muted-xs" style={{ margin: '0 0 10px' }}>
+                      {selectedServer.authType === 'oauth' && selectedServer.oauth?.status !== 'connected'
+                        ? 'OAuth 認証を完了するとツール一覧を取得できます。'
+                        : 'ツール一覧がまだ読み込まれていません。'}
+                    </p>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-xs"
+                      disabled={busy}
+                      onClick={() => {
+                        if (
+                          selectedServer.authType === 'oauth' &&
+                          selectedServer.oauth?.status !== 'connected'
+                        ) {
+                          populateServerState(selectedServer, 'auth', { setupFlow: false });
+                        } else {
+                          void handleTestAndRefreshTools();
+                        }
                       }}
                     >
-                      <option value="http">{TRANSPORT_LABELS.http}</option>
-                      <option value="sse">{TRANSPORT_LABELS.sse}</option>
-                      <option value="stdio">{TRANSPORT_LABELS.stdio}</option>
-                    </select>
+                      {selectedServer.authType === 'oauth' && selectedServer.oauth?.status !== 'connected'
+                        ? '認証へ進む'
+                        : 'ツール一覧を取得'}
+                    </button>
                   </div>
-                  <div className="form-group" style={{ justifyContent: 'flex-end' }}>
-                    <ToggleSwitch checked={enabled} label="有効にする" onChange={setEnabled} />
-                  </div>
-                </div>
-
-                {transport === 'stdio' ? (
-                  <>
-                    <div className="form-group">
-                      <label htmlFor="mcp-command">実行コマンド</label>
-                      <input
-                        id="mcp-command"
-                        type="text"
-                        value={command}
-                        onChange={(e) => setCommand(e.target.value)}
-                        placeholder="例: npx, uvx, node, python3, /usr/local/bin/my-mcp"
-                        required
-                      />
-                    </div>
-
-                    <div className="form-group">
-                      <label htmlFor="mcp-args">引数（1行につき1引数）</label>
-                      <textarea
-                        id="mcp-args"
-                        rows={4}
-                        value={argsText}
-                        onChange={(e) => setArgsText(e.target.value)}
-                        placeholder={`-y\n@modelcontextprotocol/server-filesystem\n/workspace`}
-                      />
-                    </div>
-
-                    <div className="form-group">
-                      <div className="mcp-kv-header">
-                        <span className="mcp-kv-label">環境変数（暗号化保存）</span>
-                        <button
-                          type="button"
-                          className="btn btn-secondary btn-xs"
-                          onClick={() =>
-                            setEnvRows((prev) => [
-                              ...prev,
-                              { id: uid(), name: '', value: '', keepExisting: false },
-                            ])
-                          }
-                        >
-                          + 環境変数を追加
-                        </button>
-                      </div>
-                      {envRows.map((row, idx) => (
-                        <div key={row.id} className="mcp-kv-row">
-                          <input
-                            type="text"
-                            aria-label={`環境変数名 ${idx + 1}`}
-                            placeholder="KEY"
-                            value={row.name}
-                            onChange={(e) =>
-                              setEnvRows((prev) =>
-                                prev.map((r) => (r.id === row.id ? { ...r, name: e.target.value } : r))
-                              )
-                            }
-                          />
-                          <input
-                            type="password"
-                            aria-label={`環境変数の値 ${idx + 1}`}
-                            placeholder={
-                              row.keepExisting && row.maskedValue
-                                ? `保存済 (${row.maskedValue}) — 変更時のみ入力`
-                                : 'VALUE'
-                            }
-                            value={row.value}
-                            onChange={(e) =>
-                              setEnvRows((prev) =>
-                                prev.map((r) =>
-                                  r.id === row.id
-                                    ? { ...r, value: e.target.value, keepExisting: e.target.value.length === 0 && Boolean(r.maskedValue) }
-                                    : r
-                                )
-                              )
-                            }
-                          />
-                          <button
-                            type="button"
-                            className="icon-btn"
-                            aria-label={`環境変数 ${row.name || idx + 1} を削除`}
-                            onClick={() => setEnvRows((prev) => prev.filter((r) => r.id !== row.id))}
-                          >
-                            <TrashIcon size={14} />
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  </>
                 ) : (
-                  <>
-                    <div className="form-group">
-                      <label htmlFor="mcp-url">リモート MCP URL</label>
-                      <input
-                        id="mcp-url"
-                        type="url"
-                        value={url}
-                        onChange={(e) => setUrl(e.target.value)}
-                        placeholder={
-                          transport === 'sse'
-                            ? 'https://example.com/sse'
-                            : 'https://mcp.example.com/mcp'
-                        }
-                        required
-                      />
-                    </div>
+                  <div className="mcp-tool-policy-list">
+                    {mergedTools.map((tool) => {
+                      const toolEnabled = isToolEnabled(tool.name);
+                      const isAlways = toolEnabled && alwaysAllowTools.includes(tool.name);
+                      const isExpanded = Boolean(expandedToolDescs[tool.name]);
+                      const hasDesc = Boolean(tool.description && tool.description.trim().length > 0);
+                      const isSavingThis = toolSavingName === tool.name || toolSavingName === '__bulk__';
 
-                    <div className="form-group">
-                      <label htmlFor="mcp-auth-type">認証方式</label>
-                      <select
-                        id="mcp-auth-type"
-                        value={authType}
-                        onChange={(e) => setAuthType(e.target.value as McpAuthType)}
-                      >
-                        <option value="oauth">{AUTH_LABELS.oauth}</option>
-                        <option value="bearer">{AUTH_LABELS.bearer}</option>
-                        <option value="api_key">{AUTH_LABELS.api_key}</option>
-                        <option value="headers">{AUTH_LABELS.headers}</option>
-                        <option value="none">{AUTH_LABELS.none}</option>
-                      </select>
-                    </div>
-
-                    {authType === 'bearer' && (
-                      <div className="form-group">
-                        <label htmlFor="mcp-bearer-token">Bearer トークン</label>
-                        <input
-                          id="mcp-bearer-token"
-                          type="password"
-                          value={bearerToken}
-                          onChange={(e) => {
-                            const nextVal = e.target.value;
-                            setBearerToken(nextVal);
-                            setKeepExistingBearer(nextVal.length === 0 && Boolean(existingBearerMask));
-                          }}
-                          placeholder={
-                            keepExistingBearer && existingBearerMask
-                              ? `保存済 (${existingBearerMask}) — 変更時のみ入力`
-                              : 'トークンを入力（Bearer 接頭辞は自動付与）'
-                          }
-                        />
-                      </div>
-                    )}
-
-                    {authType === 'api_key' && (
-                      <div className="mcp-grid-2">
-                        <div className="form-group">
-                          <label htmlFor="mcp-api-key-header">APIキー ヘッダー名</label>
-                          <input
-                            id="mcp-api-key-header"
-                            type="text"
-                            value={apiKeyHeaderName}
-                            onChange={(e) => setApiKeyHeaderName(e.target.value)}
-                            placeholder="X-API-Key"
-                          />
-                        </div>
-                        <div className="form-group">
-                          <label htmlFor="mcp-api-key-value">APIキー値</label>
-                          <input
-                            id="mcp-api-key-value"
-                            type="password"
-                            value={apiKeyValue}
-                            onChange={(e) => {
-                              const nextVal = e.target.value;
-                              setApiKeyValue(nextVal);
-                              setKeepExistingApiKey(nextVal.length === 0 && Boolean(existingApiKeyMask));
-                            }}
-                            placeholder={
-                              keepExistingApiKey && existingApiKeyMask
-                                ? `保存済 (${existingApiKeyMask}) — 変更時のみ入力`
-                                : 'APIキーを入力'
-                            }
-                          />
-                        </div>
-                      </div>
-                    )}
-
-                    {authType === 'oauth' && (
-                      <div className="mcp-oauth-box">
-                        <div className="mcp-oauth-status-row">
-                          <div>
-                            <div style={{ fontWeight: 600, fontSize: 13 }}>
-                              OAuth 接続状態:{' '}
-                              {selectedServer?.oauth?.status === 'connected'
-                                ? '接続済み'
-                                : selectedServer?.oauth?.status === 'expired'
-                                  ? '有効期限切れ（再認証が必要）'
-                                  : selectedServer?.oauth?.status === 'error'
-                                    ? 'エラー'
-                                    : '未認証'}
+                      return (
+                        <div
+                          key={tool.name}
+                          className={`mcp-tool-policy-row ${toolEnabled ? '' : 'is-disabled'}`}
+                        >
+                          <div className="mcp-tool-policy-top">
+                            <div className="mcp-tool-policy-left">
+                              <ToggleSwitch
+                                checked={toolEnabled}
+                                disabled={isSavingThis}
+                                label=""
+                                ariaLabel={`${tool.name} を有効にする`}
+                                onChange={(next) => handleToggleToolEnabled(tool.name, next)}
+                              />
+                              <div className="mcp-tool-policy-identity">
+                                <code className="mcp-tool-policy-name">{tool.name}</code>
+                                {hasDesc && (
+                                  <button
+                                    type="button"
+                                    className="mcp-tool-desc-toggle"
+                                    aria-expanded={isExpanded}
+                                    onClick={() => toggleToolDescription(tool.name)}
+                                  >
+                                    <span>説明</span>
+                                    <ChevronIcon size={12} dir={isExpanded ? 'up' : 'down'} />
+                                  </button>
+                                )}
+                              </div>
                             </div>
-                            {selectedServer?.oauth?.expiresAt && (
-                              <div className="muted-xs">
-                                有効期限: {new Date(selectedServer.oauth.expiresAt).toLocaleString()}
-                                {selectedServer.oauth.hasRefreshToken ? '（自動リフレッシュ対応）' : ''}
-                              </div>
-                            )}
-                            {selectedServer?.oauth?.error && (
-                              <div className="muted-xs" style={{ color: '#f87171', marginTop: 2 }}>
-                                {selectedServer.oauth.error}
-                              </div>
-                            )}
-                          </div>
-                          {editorMode === 'edit' && selectedServer ? (
-                            <div className="row-actions">
-                              <button
-                                type="button"
-                                className="btn btn-primary btn-xs"
-                                onClick={() => void handleStartOAuth()}
-                                disabled={busy}
+
+                            {toolEnabled ? (
+                              <div
+                                className="mcp-policy-segmented"
+                                role="group"
+                                aria-label={`${tool.name} の許可設定`}
                               >
-                                {selectedServer.oauth?.status === 'connected' ? '再認証' : 'OAuth 認証を開始'}
-                              </button>
-                              {selectedServer.oauth?.status === 'connected' && (
                                 <button
                                   type="button"
-                                  className="btn btn-secondary btn-xs"
-                                  onClick={() => void handleDisconnectOAuth()}
-                                  disabled={busy}
+                                  className={`mcp-policy-btn ${!isAlways ? 'active' : ''}`}
+                                  aria-pressed={!isAlways}
+                                  disabled={isSavingThis}
+                                  onClick={() => handleSetToolPolicy(tool.name, 'ask')}
                                 >
-                                  切断
+                                  確認
                                 </button>
-                              )}
+                                <button
+                                  type="button"
+                                  className={`mcp-policy-btn is-always ${isAlways ? 'active' : ''}`}
+                                  aria-pressed={isAlways}
+                                  disabled={isSavingThis}
+                                  onClick={() => handleSetToolPolicy(tool.name, 'always')}
+                                >
+                                  常に許可
+                                </button>
+                              </div>
+                            ) : (
+                              <span className="mcp-tool-disabled-pill">無効</span>
+                            )}
+                          </div>
+
+                          {hasDesc && isExpanded && (
+                            <div className="mcp-tool-desc-panel">
+                              {tool.description}
                             </div>
-                          ) : (
-                            <span className="muted-xs">保存後に「OAuth 認証を開始」できます</span>
                           )}
                         </div>
-
-                        <div className="mcp-callback-row">
-                          <span className="muted-xs">コールバック URL (Redirect URI):</span>
-                          <div className="mcp-callback-copy">
-                            <code>{callbackUrl}</code>
-                            <button
-                              type="button"
-                              className="btn btn-secondary btn-xs"
-                              onClick={() => void copyCallbackUrl()}
-                            >
-                              コピー
-                            </button>
-                          </div>
-                        </div>
-
-                        {editorMode === 'edit' && selectedServer && oauthPendingUrl && (
-                          <div className="form-group" style={{ marginTop: 10 }}>
-                            <label htmlFor="mcp-oauth-manual-code" className="muted-xs">
-                              アプリ内で認証を完了（認可コードまたはリダイレクト先URLを貼り付け）:
-                            </label>
-                            <div className="mcp-kv-row" style={{ marginTop: 4 }}>
-                              <input
-                                id="mcp-oauth-manual-code"
-                                type="text"
-                                value={oauthManualInput}
-                                onChange={(e) => setOAuthManualInput(e.target.value)}
-                                placeholder="https://.../oauth-callback?code=...&state=... または code"
-                              />
-                              <button
-                                type="button"
-                                className="btn btn-primary btn-xs"
-                                disabled={busy || !oauthManualInput.trim()}
-                                onClick={() => void handleCompleteOAuthManual()}
-                              >
-                                認証を完了
-                              </button>
-                            </div>
-                          </div>
-                        )}
-
-                        <button
-                          type="button"
-                          className="btn btn-secondary btn-xs"
-                          style={{ marginTop: 8 }}
-                          onClick={() => setShowOAuthAdvanced((v) => !v)}
-                        >
-                          {showOAuthAdvanced ? '▲ 詳細OAuth設定を隠す' : '▼ 詳細OAuth設定（手動Client ID/Secret等）'}
-                        </button>
-
-                        {showOAuthAdvanced && (
-                          <div className="mcp-oauth-advanced">
-                            <p className="muted-xs" style={{ margin: '0 0 8px' }}>
-                              RFC 9728 / 動的クライアント登録（DCR）対応サーバーでは空欄のままで自動構成されます。Google Workspace・GitHub・Slackなど事前登録が必要なサービスでは Client ID / Secret を入力してください。
-                            </p>
-                            <div className="mcp-grid-2">
-                              <div className="form-group">
-                                <label htmlFor="mcp-oauth-client-id">Client ID（任意）</label>
-                                <input
-                                  id="mcp-oauth-client-id"
-                                  type="text"
-                                  value={oauthClientId}
-                                  onChange={(e) => setOAuthClientId(e.target.value)}
-                                  placeholder="自動登録または手動入力"
-                                />
-                              </div>
-                              <div className="form-group">
-                                <label htmlFor="mcp-oauth-client-secret">Client Secret（任意）</label>
-                                <input
-                                  id="mcp-oauth-client-secret"
-                                  type="password"
-                                  value={oauthClientSecret}
-                                  onChange={(e) => {
-                                    setOAuthClientSecret(e.target.value);
-                                    if (e.target.value) setClearClientSecret(false);
-                                  }}
-                                  placeholder={
-                                    selectedServer?.oauth?.hasClientSecret && !clearClientSecret
-                                      ? '保存済 — 変更時のみ入力'
-                                      : '必要な場合のみ入力'
-                                  }
-                                />
-                              </div>
-                            </div>
-                            <div className="mcp-grid-2">
-                              <div className="form-group">
-                                <label htmlFor="mcp-oauth-auth-url">Authorization URL（任意）</label>
-                                <input
-                                  id="mcp-oauth-auth-url"
-                                  type="url"
-                                  value={oauthAuthUrl}
-                                  onChange={(e) => setOAuthAuthUrl(e.target.value)}
-                                  placeholder="空欄で自動検出"
-                                />
-                              </div>
-                              <div className="form-group">
-                                <label htmlFor="mcp-oauth-token-url">Token URL（任意）</label>
-                                <input
-                                  id="mcp-oauth-token-url"
-                                  type="url"
-                                  value={oauthTokenUrl}
-                                  onChange={(e) => setOAuthTokenUrl(e.target.value)}
-                                  placeholder="空欄で自動検出"
-                                />
-                              </div>
-                            </div>
-                            <div className="form-group">
-                              <label htmlFor="mcp-oauth-scopes">Scopes（スペース区切り・任意）</label>
-                              <input
-                                id="mcp-oauth-scopes"
-                                type="text"
-                                value={oauthScopes}
-                                onChange={(e) => setOAuthScopes(e.target.value)}
-                                placeholder="例: read write offline_access"
-                              />
-                            </div>
-                            <div className="form-group">
-                              <label htmlFor="mcp-oauth-extra-params">追加認可パラメータ（1行に key=value・任意）</label>
-                              <textarea
-                                id="mcp-oauth-extra-params"
-                                rows={2}
-                                value={oauthExtraParamsText}
-                                onChange={(e) => setOAuthExtraParamsText(e.target.value)}
-                                placeholder={`access_type=offline\nprompt=consent`}
-                              />
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {(authType === 'headers' || authType === 'bearer' || authType === 'api_key' || authType === 'oauth') && (
-                      <div className="form-group">
-                        <div className="mcp-kv-header">
-                          <span className="mcp-kv-label">
-                            {authType === 'headers' ? 'HTTP ヘッダー（暗号化保存）' : '追加 HTTP ヘッダー（任意）'}
-                          </span>
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-xs"
-                            onClick={() =>
-                              setHeaderRows((prev) => [
-                                ...prev,
-                                { id: uid(), name: '', value: '', keepExisting: false },
-                              ])
-                            }
-                          >
-                            + ヘッダーを追加
-                          </button>
-                        </div>
-                        {headerRows.map((row, idx) => (
-                          <div key={row.id} className="mcp-kv-row">
-                            <input
-                              type="text"
-                              aria-label={`HTTPヘッダー名 ${idx + 1}`}
-                              placeholder="Header-Name"
-                              value={row.name}
-                              onChange={(e) =>
-                                setHeaderRows((prev) =>
-                                  prev.map((r) => (r.id === row.id ? { ...r, name: e.target.value } : r))
-                                )
-                              }
-                            />
-                            <input
-                              type="password"
-                              aria-label={`HTTPヘッダー値 ${idx + 1}`}
-                              placeholder={
-                                row.keepExisting && row.maskedValue
-                                  ? `保存済 (${row.maskedValue}) — 変更時のみ入力`
-                                  : 'Header Value'
-                              }
-                              value={row.value}
-                              onChange={(e) =>
-                                setHeaderRows((prev) =>
-                                  prev.map((r) =>
-                                    r.id === row.id
-                                      ? { ...r, value: e.target.value, keepExisting: e.target.value.length === 0 && Boolean(r.maskedValue) }
-                                      : r
-                                  )
-                                )
-                              }
-                            />
-                            <button
-                              type="button"
-                              className="icon-btn"
-                              aria-label={`HTTPヘッダー ${row.name || idx + 1} を削除`}
-                              onClick={() => setHeaderRows((prev) => prev.filter((r) => r.id !== row.id))}
-                            >
-                              <TrashIcon size={14} />
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </>
+                      );
+                    })}
+                  </div>
                 )}
 
-                <div className="form-group">
-                  <div className="mcp-kv-header">
-                    <span className="mcp-kv-label">
-                      許可するツール（{allowedTools.length === 0 ? '全ツール許可' : `${allowedTools.length} 個のみ許可`}）
-                    </span>
-                    {allowedTools.length > 0 && (
-                      <button
-                        type="button"
-                        className="btn btn-secondary btn-xs"
-                        onClick={() => setAllowedTools([])}
-                      >
-                        全ツール許可に戻す
-                      </button>
-                    )}
+                <details className="mcp-manual-tool-disclosure">
+                  <summary>ツール名を手動で追加</summary>
+                  <div className="mcp-tools-add-row" style={{ marginTop: 8 }}>
+                    <input
+                      type="text"
+                      value={toolInputDraft}
+                      onChange={(e) => setToolInputDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          handleAddManualTools();
+                        }
+                      }}
+                      placeholder="ツール名（カンマ区切りで複数可）"
+                      aria-label="追加するツール名"
+                    />
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-xs"
+                      disabled={!toolInputDraft.trim() || toolSavingName !== null}
+                      onClick={handleAddManualTools}
+                    >
+                      追加
+                    </button>
                   </div>
-                  <div className="mcp-tools-box">
-                    <div className="muted-xs">
-                      未設定（空）の場合はこのMCPサーバーの<strong>全ツールが許可</strong>されます。特定のツールのみ利用を許可したい場合に追加・選択してください。
-                    </div>
+                </details>
+              </section>
 
-                    {allowedTools.length > 0 && (
-                      <div className="mcp-tools-chips" aria-label="許可されたツール一覧">
-                        {allowedTools.map((toolName) => (
-                          <button
-                            key={toolName}
-                            type="button"
-                            className="mcp-tool-chip"
-                            onClick={() => toggleAllowedTool(toolName)}
-                            title={`「${toolName}」を許可リストから削除`}
-                          >
-                            <span>{toolName}</span>
-                            <span aria-hidden="true">×</span>
-                          </button>
-                        ))}
-                      </div>
-                    )}
-
-                    <div className="mcp-tools-add-row">
-                      <input
-                        id="mcp-allowed-tool-input"
-                        type="text"
-                        value={toolInputDraft}
-                        onChange={(e) => setToolInputDraft(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            e.preventDefault();
-                            addDraftTools();
-                          }
-                        }}
-                        placeholder="許可するツール名を入力（カンマ区切り可・Enterで追加）"
-                      />
-                      <button
-                        type="button"
-                        className="btn btn-secondary btn-xs"
-                        onClick={addDraftTools}
-                        disabled={!toolInputDraft.trim()}
-                      >
-                        追加
-                      </button>
-                    </div>
-
-                    {discoveredTools.length > 0 ? (
-                      <>
-                        <div className="mcp-kv-header" style={{ marginBottom: 0 }}>
-                          <span className="muted-xs">接続テストで検出されたツール ({discoveredTools.length} 件)</span>
-                          <div className="row-actions">
-                            <button
-                              type="button"
-                              className="btn btn-secondary btn-xs"
-                              onClick={() =>
-                                setAllowedTools((prev) => {
-                                  const next = new Set(prev);
-                                  for (const t of discoveredTools) next.add(t.name);
-                                  return Array.from(next);
-                                })
-                              }
-                            >
-                              検出ツールを全選択
-                            </button>
-                          </div>
-                        </div>
-                        <div className="mcp-tools-discovered">
-                          {discoveredTools.map((t) => {
-                            const checked = allowedTools.includes(t.name);
-                            return (
-                              <label key={t.name} className="mcp-tool-check-row">
-                                <input
-                                  type="checkbox"
-                                  checked={checked}
-                                  onChange={() => toggleAllowedTool(t.name)}
-                                />
-                                <span className="mcp-tool-check-meta">
-                                  <span className="mcp-tool-check-name">{t.name}</span>
-                                  {t.description && (
-                                    <span className="mcp-tool-check-desc">{t.description}</span>
-                                  )}
-                                </span>
-                              </label>
-                            );
-                          })}
-                        </div>
-                      </>
-                    ) : (
-                      <div className="muted-xs">
-                        {editorMode === 'edit'
-                          ? 'ヒント: 上部の「接続テスト」を実行するとサーバーが公開するツール一覧を取得してチェックボックスから選べます。'
-                          : 'ヒント: 先にサーバーを追加して保存し、「接続テスト」を実行するとツール一覧を取得して選べます。'}
-                      </div>
-                    )}
+              {/* Secondary Section: Connection & Auth Editing (clearly separated) */}
+              <details className="mcp-settings-disclosure">
+                <summary>接続・認証設定を編集</summary>
+                <form onSubmit={handleSaveConnectionSettings} className="mcp-settings-edit-form">
+                  {renderConnectionFields('mcp-edit', true)}
+                  <div className="row-actions mcp-form-actions" style={{ marginTop: 6 }}>
+                    <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
+                      {busy ? '保存中...' : '接続設定を保存'}
+                    </button>
                   </div>
-                </div>
-
-                <div className="row-actions mcp-form-actions" style={{ marginTop: 14 }}>
-                  <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
-                    {editorMode === 'new' ? 'MCPサーバーを追加' : '変更を保存'}
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-sm"
-                    onClick={() => {
-                      setEditorMode('idle');
-                      setMobileShowEditor(false);
-                    }}
-                  >
-                    キャンセル
-                  </button>
-                </div>
-              </form>
-            )}
-          </div>
+                </form>
+              </details>
+            </div>
+          )}
         </div>
+      </div>
     </ModalDialog>
   );
 };

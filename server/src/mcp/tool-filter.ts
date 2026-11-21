@@ -234,7 +234,7 @@ export function extractMcpToolsFromJsonRpcPayload(payload: unknown): McpDiscover
       seen.add(name);
       const description =
         typeof t.description === 'string' && t.description.trim()
-          ? t.description.trim().slice(0, 300)
+          ? t.description.trim().slice(0, 2000)
           : undefined;
       out.push(description ? { name, description } : { name });
       if (out.length >= MAX_MCP_ALLOWED_TOOLS) return out;
@@ -289,7 +289,7 @@ export function createSseMcpToolFilterTransform(opts: {
       return `${lines.join('\n')}\n\n`;
     }
 
-    if (opts.allowedTools && opts.allowedTools.size > 0 && dataPayloads.length > 0) {
+    if (opts.allowedTools != null && dataPayloads.length > 0) {
       const rawJson = dataPayloads.join('\n').trim();
       if (rawJson.startsWith('{') || rawJson.startsWith('[')) {
         try {

@@ -8,12 +8,15 @@ import type {
   ArtifactRecord,
   AttachmentRef,
   ChatRecord,
+  ElicitationContentValue,
+  ElicitationFormSchema,
   McpAuthType,
   McpOAuthStatus,
   McpScope,
   McpTransport,
   MessageActivity,
   MessageRecord,
+  PendingElicitationRecord,
   PendingPermissionRecord,
   PermissionOptionItem,
   PreviewKind,
@@ -44,6 +47,9 @@ export interface StoredMcpServerRow {
   transport: McpTransport;
   enabled: boolean;
   allowedToolsJson: string;
+  disabledToolsJson: string;
+  alwaysAllowToolsJson: string;
+  discoveredToolsJson: string;
   command: string | null;
   argsJson: string;
   encryptedEnvJson: string | null;
@@ -232,6 +238,7 @@ export class AppDatabase {
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         tool_call_json TEXT NOT NULL,
         options_json TEXT NOT NULL,
+        always_allow_rule TEXT,
         status TEXT NOT NULL DEFAULT 'pending',
         selected_option_id TEXT,
         resolved_by_client_id TEXT,
@@ -239,6 +246,27 @@ export class AppDatabase {
         resolved_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_perms_chat_status ON pending_permissions(chat_id, status);
+
+      CREATE TABLE IF NOT EXISTS pending_elicitations (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        tool_call_id TEXT,
+        external_elicitation_id TEXT,
+        mode TEXT NOT NULL,
+        message TEXT NOT NULL,
+        requested_schema_json TEXT,
+        url TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        selected_action TEXT,
+        response_content_json TEXT,
+        resolved_by_client_id TEXT,
+        created_at INTEGER NOT NULL,
+        resolved_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_elicit_chat_status ON pending_elicitations(chat_id, status);
+      CREATE INDEX IF NOT EXISTS idx_elicit_external_id ON pending_elicitations(external_elicitation_id);
 
       CREATE TABLE IF NOT EXISTS artifacts (
         id TEXT PRIMARY KEY,
@@ -291,6 +319,9 @@ export class AppDatabase {
         transport TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1,
         allowed_tools_json TEXT NOT NULL DEFAULT '[]',
+        disabled_tools_json TEXT NOT NULL DEFAULT '[]',
+        always_allow_tools_json TEXT NOT NULL DEFAULT '[]',
+        discovered_tools_json TEXT NOT NULL DEFAULT '[]',
         command TEXT,
         args_json TEXT NOT NULL DEFAULT '[]',
         encrypted_env_json TEXT,
@@ -334,9 +365,22 @@ export class AppDatabase {
     if (!msgCols.some((col) => col.name === 'session_messages_json')) {
       this.db.exec("ALTER TABLE messages ADD COLUMN session_messages_json TEXT NOT NULL DEFAULT '[]';");
     }
+    const permCols = this.db.prepare('PRAGMA table_info(pending_permissions)').all() as Array<{ name: string }>;
+    if (!permCols.some((col) => col.name === 'always_allow_rule')) {
+      this.db.exec('ALTER TABLE pending_permissions ADD COLUMN always_allow_rule TEXT;');
+    }
     const mcpCols = this.db.prepare('PRAGMA table_info(mcp_servers)').all() as Array<{ name: string }>;
     if (!mcpCols.some((col) => col.name === 'allowed_tools_json')) {
       this.db.exec("ALTER TABLE mcp_servers ADD COLUMN allowed_tools_json TEXT NOT NULL DEFAULT '[]';");
+    }
+    if (!mcpCols.some((col) => col.name === 'disabled_tools_json')) {
+      this.db.exec("ALTER TABLE mcp_servers ADD COLUMN disabled_tools_json TEXT NOT NULL DEFAULT '[]';");
+    }
+    if (!mcpCols.some((col) => col.name === 'always_allow_tools_json')) {
+      this.db.exec("ALTER TABLE mcp_servers ADD COLUMN always_allow_tools_json TEXT NOT NULL DEFAULT '[]';");
+    }
+    if (!mcpCols.some((col) => col.name === 'discovered_tools_json')) {
+      this.db.exec("ALTER TABLE mcp_servers ADD COLUMN discovered_tools_json TEXT NOT NULL DEFAULT '[]';");
     }
   }
 
@@ -367,6 +411,15 @@ export class AppDatabase {
         .prepare(
           `UPDATE pending_permissions
            SET status = 'cancelled',
+               resolved_at = COALESCE(resolved_at, ?)
+           WHERE status = 'pending'`
+        )
+        .run(now);
+      this.db
+        .prepare(
+          `UPDATE pending_elicitations
+           SET status = 'cancelled',
+               selected_action = COALESCE(selected_action, 'cancel'),
                resolved_at = COALESCE(resolved_at, ?)
            WHERE status = 'pending'`
         )
@@ -1251,12 +1304,13 @@ export class AppDatabase {
     userId: string;
     toolCall: ToolCallItem;
     options: PermissionOptionItem[];
+    alwaysAllowRule?: string | null;
   }): PendingPermissionRecord {
     const now = Date.now();
     this.db
       .prepare(
-        `INSERT INTO pending_permissions (id, run_id, chat_id, user_id, tool_call_json, options_json, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`
+        `INSERT INTO pending_permissions (id, run_id, chat_id, user_id, tool_call_json, options_json, always_allow_rule, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`
       )
       .run(
         params.id,
@@ -1265,6 +1319,7 @@ export class AppDatabase {
         params.userId,
         JSON.stringify(params.toolCall),
         JSON.stringify(params.options),
+        params.alwaysAllowRule ?? null,
         now
       );
     return this.getPermission(params.userId, params.id)!;
@@ -1311,8 +1366,129 @@ export class AppDatabase {
       userId: String(r.user_id),
       toolCall: JSON.parse(String(r.tool_call_json)) as ToolCallItem,
       options: JSON.parse(String(r.options_json)) as PermissionOptionItem[],
+      alwaysAllowRule: r.always_allow_rule ? String(r.always_allow_rule) : null,
       status: r.status as PendingPermissionRecord['status'],
       selectedOptionId: r.selected_option_id ? String(r.selected_option_id) : null,
+      resolvedByClientId: r.resolved_by_client_id ? String(r.resolved_by_client_id) : null,
+      createdAt: Number(r.created_at),
+      resolvedAt: r.resolved_at !== null ? Number(r.resolved_at) : null,
+    };
+  }
+
+  createPendingElicitation(params: {
+    id: string;
+    runId: string;
+    chatId: string;
+    userId: string;
+    toolCallId?: string | null;
+    externalElicitationId?: string | null;
+    mode: 'form' | 'url';
+    message: string;
+    requestedSchema?: ElicitationFormSchema | null;
+    url?: string | null;
+  }): PendingElicitationRecord {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO pending_elicitations (
+           id, run_id, chat_id, user_id, tool_call_id, external_elicitation_id, mode, message,
+           requested_schema_json, url, status, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`
+      )
+      .run(
+        params.id,
+        params.runId,
+        params.chatId,
+        params.userId,
+        params.toolCallId ?? null,
+        params.externalElicitationId ?? null,
+        params.mode,
+        params.message,
+        params.requestedSchema ? JSON.stringify(params.requestedSchema) : null,
+        params.url ?? null,
+        now
+      );
+    return this.getElicitation(params.userId, params.id)!;
+  }
+
+  getElicitation(userId: string, elicitationId: string): PendingElicitationRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM pending_elicitations WHERE id = ? AND user_id = ?')
+      .get(elicitationId, userId) as Record<string, unknown> | undefined;
+    return row ? this.mapElicitation(row) : null;
+  }
+
+  getPendingElicitationByExternalId(
+    userId: string,
+    chatId: string,
+    externalElicitationId: string
+  ): PendingElicitationRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM pending_elicitations
+         WHERE user_id = ? AND chat_id = ? AND external_elicitation_id = ? AND status = 'pending'
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(userId, chatId, externalElicitationId) as Record<string, unknown> | undefined;
+    return row ? this.mapElicitation(row) : null;
+  }
+
+  listPendingElicitationsForChat(userId: string, chatId: string): PendingElicitationRecord[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM pending_elicitations WHERE chat_id = ? AND user_id = ? AND status = 'pending' ORDER BY created_at ASC"
+      )
+      .all(chatId, userId) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapElicitation(r));
+  }
+
+  resolveElicitationAtomically(params: {
+    userId: string;
+    elicitationId: string;
+    selectedAction: 'accept' | 'decline' | 'cancel';
+    responseContent?: Record<string, ElicitationContentValue> | null;
+    status: 'resolved' | 'cancelled';
+    clientId?: string | null;
+  }): PendingElicitationRecord | null {
+    const now = Date.now();
+    const info = this.db
+      .prepare(
+        `UPDATE pending_elicitations
+         SET status = ?, selected_action = ?, response_content_json = ?, resolved_by_client_id = ?, resolved_at = ?
+         WHERE id = ? AND user_id = ? AND status = 'pending'`
+      )
+      .run(
+        params.status,
+        params.selectedAction,
+        params.responseContent ? JSON.stringify(params.responseContent) : null,
+        params.clientId ?? null,
+        now,
+        params.elicitationId,
+        params.userId
+      );
+    if (Number(info.changes) === 0) return null;
+    return this.getElicitation(params.userId, params.elicitationId);
+  }
+
+  private mapElicitation(r: Record<string, unknown>): PendingElicitationRecord {
+    return {
+      id: String(r.id),
+      runId: String(r.run_id),
+      chatId: String(r.chat_id),
+      userId: String(r.user_id),
+      toolCallId: r.tool_call_id ? String(r.tool_call_id) : null,
+      externalElicitationId: r.external_elicitation_id ? String(r.external_elicitation_id) : null,
+      mode: (String(r.mode) === 'url' ? 'url' : 'form') as PendingElicitationRecord['mode'],
+      message: String(r.message),
+      requestedSchema: r.requested_schema_json
+        ? (JSON.parse(String(r.requested_schema_json)) as ElicitationFormSchema)
+        : null,
+      url: r.url ? String(r.url) : null,
+      status: r.status as PendingElicitationRecord['status'],
+      selectedAction: (r.selected_action ? String(r.selected_action) : null) as PendingElicitationRecord['selectedAction'],
+      responseContent: r.response_content_json
+        ? (JSON.parse(String(r.response_content_json)) as Record<string, ElicitationContentValue>)
+        : null,
       resolvedByClientId: r.resolved_by_client_id ? String(r.resolved_by_client_id) : null,
       createdAt: Number(r.created_at),
       resolvedAt: r.resolved_at !== null ? Number(r.resolved_at) : null,
@@ -1688,6 +1864,9 @@ export class AppDatabase {
           : 'stdio',
       enabled: Number(row.enabled) === 1,
       allowedToolsJson: String(row.allowed_tools_json ?? '[]'),
+      disabledToolsJson: String(row.disabled_tools_json ?? '[]'),
+      alwaysAllowToolsJson: String(row.always_allow_tools_json ?? '[]'),
+      discoveredToolsJson: String(row.discovered_tools_json ?? '[]'),
       command: row.command ? String(row.command) : null,
       argsJson: String(row.args_json ?? '[]'),
       encryptedEnvJson: row.encrypted_env_json ? String(row.encrypted_env_json) : null,
@@ -1782,6 +1961,9 @@ export class AppDatabase {
     transport: McpTransport;
     enabled: boolean;
     allowedToolsJson?: string;
+    disabledToolsJson?: string;
+    alwaysAllowToolsJson?: string;
+    discoveredToolsJson?: string;
     command: string | null;
     argsJson: string;
     encryptedEnvJson: string | null;
@@ -1800,13 +1982,14 @@ export class AppDatabase {
     this.db
       .prepare(
         `INSERT INTO mcp_servers (
-          id, name, description, scope, owner_user_id, transport, enabled, allowed_tools_json,
+          id, name, description, scope, owner_user_id, transport, enabled,
+          allowed_tools_json, disabled_tools_json, always_allow_tools_json, discovered_tools_json,
           command, args_json, encrypted_env_json,
           url, auth_type, encrypted_headers_json,
           oauth_config_json, encrypted_oauth_client_secret, encrypted_oauth_tokens_json,
           oauth_status, oauth_error, oauth_updated_at,
           created_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         input.id,
@@ -1817,6 +2000,9 @@ export class AppDatabase {
         input.transport,
         input.enabled ? 1 : 0,
         input.allowedToolsJson ?? '[]',
+        input.disabledToolsJson ?? '[]',
+        input.alwaysAllowToolsJson ?? '[]',
+        input.discoveredToolsJson ?? '[]',
         input.command,
         input.argsJson,
         input.encryptedEnvJson,
@@ -1846,6 +2032,9 @@ export class AppDatabase {
       transport: McpTransport;
       enabled: boolean;
       allowedToolsJson: string;
+      disabledToolsJson: string;
+      alwaysAllowToolsJson: string;
+      discoveredToolsJson: string;
       command: string | null;
       argsJson: string;
       encryptedEnvJson: string | null;
@@ -1873,6 +2062,9 @@ export class AppDatabase {
           transport = ?,
           enabled = ?,
           allowed_tools_json = ?,
+          disabled_tools_json = ?,
+          always_allow_tools_json = ?,
+          discovered_tools_json = ?,
           command = ?,
           args_json = ?,
           encrypted_env_json = ?,
@@ -1896,6 +2088,9 @@ export class AppDatabase {
         patch.transport !== undefined ? patch.transport : existing.transport,
         (patch.enabled !== undefined ? patch.enabled : existing.enabled) ? 1 : 0,
         patch.allowedToolsJson !== undefined ? patch.allowedToolsJson : existing.allowedToolsJson,
+        patch.disabledToolsJson !== undefined ? patch.disabledToolsJson : existing.disabledToolsJson,
+        patch.alwaysAllowToolsJson !== undefined ? patch.alwaysAllowToolsJson : existing.alwaysAllowToolsJson,
+        patch.discoveredToolsJson !== undefined ? patch.discoveredToolsJson : existing.discoveredToolsJson,
         patch.command !== undefined ? patch.command : existing.command,
         patch.argsJson !== undefined ? patch.argsJson : existing.argsJson,
         patch.encryptedEnvJson !== undefined ? patch.encryptedEnvJson : existing.encryptedEnvJson,

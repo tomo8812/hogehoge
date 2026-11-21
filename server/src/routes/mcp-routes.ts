@@ -90,6 +90,8 @@ const createMcpSchema = z.object({
   transport: z.enum(['stdio', 'http', 'sse']),
   enabled: z.boolean().optional(),
   allowedTools: z.array(z.string().max(200)).max(500).nullable().optional(),
+  disabledTools: z.array(z.string().max(200)).max(500).nullable().optional(),
+  alwaysAllowTools: z.array(z.string().max(200)).max(500).nullable().optional(),
   command: z.string().max(1024).nullable().optional(),
   args: z.array(z.string().max(4096)).max(100).optional(),
   env: z.array(secretEntrySchema).max(100).optional(),
@@ -429,8 +431,8 @@ export async function registerMcpRoutes(app: FastifyInstance, deps: McpRouteDeps
     if (!session) return;
     const { id } = req.params as { id: string };
     try {
-      const result = await mcpService.testServer(session.user.id, id);
-      return { result };
+      const { server, ...result } = await mcpService.testServer(session.user.id, id);
+      return server ? { result, server } : { result };
     } catch (err) {
       return handleMcpError(reply, err);
     }

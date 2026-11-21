@@ -81,6 +81,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
   for (const profileDir of db.listAgyProfileDirs()) {
     try {
       ensureAgyProfileSettings(profileDir);
+      mcpService.syncAllSharedMcpPermissionsToProfile(profileDir);
     } catch (err) {
       app.log.error({ err, profileDir }, 'Failed to initialize Antigravity profile settings');
     }
@@ -108,7 +109,7 @@ export async function createApp(configOverrides: Partial<AppConfig> = {}): Promi
     };
   });
 
-  await registerAuthRoutes(app, { config, db, hub, agyAuth, buildId, buildInfo });
+  await registerAuthRoutes(app, { config, db, hub, agyAuth, mcpService, buildId, buildInfo });
   await registerProjectRoutes(app, { config, db, hub, agyAuth });
   await registerChatRoutes(app, { config, db, hub, agyAuth, acp, scheduler, skillService });
   await registerFileRoutes(app, { config, db, hub, agyAuth });
