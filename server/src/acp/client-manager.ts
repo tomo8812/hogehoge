@@ -194,11 +194,8 @@ export function deriveAgyPermissionRule(params: {
     const rawCmd = firstStr(rawObj?.CommandLine, rawObj?.command, rawObj?.cmd);
     if (rawCmd) {
       const cleanLine = rawCmd.split(/[\r\n\0]/)[0]?.trim() ?? '';
-      const safeTarget = cleanLine.includes(')')
-        ? cleanLine.slice(0, cleanLine.indexOf(')')).trim().split(/\s+/)[0] ?? ''
-        : cleanLine;
-      if (safeTarget) {
-        const rule = `command(${safeTarget})`;
+      if (cleanLine && !cleanLine.includes(')')) {
+        const rule = `command(${cleanLine})`;
         if (isValidAgyPermissionRule(rule)) return rule;
       }
     }
@@ -1146,8 +1143,19 @@ export class AcpClientManager {
       }
     }
 
+    const hasPendingForRun =
+      (targetBridge
+        ? targetBridge.pendingResolvers.size > 0 || targetBridge.pendingElicitationResolvers.size > 0
+        : false) ||
+      this.db
+        .listPendingPermissionsForChat(params.userId, params.chatId)
+        .some((p) => p.runId === updated.runId) ||
+      this.db
+        .listPendingElicitationsForChat(params.userId, params.chatId)
+        .some((e) => e.runId === updated.runId);
+
     const run = this.db.getRun(params.userId, updated.runId);
-    if (run && run.status === 'awaiting_permission') {
+    if (run && run.status === 'awaiting_permission' && !hasPendingForRun) {
       this.db.updateRun(params.userId, run.id, { status: 'running' });
     }
 
@@ -1156,7 +1164,7 @@ export class AcpClientManager {
       type: 'permission.resolved',
       chatId: params.chatId,
       runId: updated.runId,
-      payload: { permission: updated },
+      payload: { permission: updated, hasPendingForRun },
     });
     return updated;
   }
@@ -1221,14 +1229,19 @@ export class AcpClientManager {
       }
     }
 
+    const hasPendingForRun =
+      (targetBridge
+        ? targetBridge.pendingResolvers.size > 0 || targetBridge.pendingElicitationResolvers.size > 0
+        : false) ||
+      this.db
+        .listPendingPermissionsForChat(params.userId, params.chatId)
+        .some((p) => p.runId === updated.runId) ||
+      this.db
+        .listPendingElicitationsForChat(params.userId, params.chatId)
+        .some((e) => e.runId === updated.runId);
+
     const run = this.db.getRun(params.userId, updated.runId);
-    if (
-      run &&
-      run.status === 'awaiting_permission' &&
-      (!targetBridge ||
-        (targetBridge.pendingResolvers.size === 0 &&
-          targetBridge.pendingElicitationResolvers.size === 0))
-    ) {
+    if (run && run.status === 'awaiting_permission' && !hasPendingForRun) {
       this.db.updateRun(params.userId, run.id, { status: 'running' });
     }
 
@@ -1237,7 +1250,7 @@ export class AcpClientManager {
       type: 'elicitation.resolved',
       chatId: params.chatId,
       runId: updated.runId,
-      payload: { elicitation: updated },
+      payload: { elicitation: updated, hasPendingForRun },
     });
     return updated;
   }

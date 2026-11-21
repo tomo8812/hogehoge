@@ -551,6 +551,21 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     expect(
       deriveAgyPermissionRule({
         toolCall: {
+          toolCallId: 'tc-3b',
+          title: 'Run command with parens',
+          name: 'run_command',
+          kind: 'execute',
+          status: 'pending',
+          rawInput: { CommandLine: 'node -e "console.log(1)"' },
+        },
+        workspaceDir: ws,
+        sandboxWorkspaceRoot: '/workspace',
+      })
+    ).toBeNull();
+
+    expect(
+      deriveAgyPermissionRule({
+        toolCall: {
           toolCallId: 'tc-4',
           title: 'Read URL',
           name: 'read_url_content',

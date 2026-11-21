@@ -189,6 +189,10 @@ export const App: React.FC = () => {
   messagesRef.current = messages;
   const activeRunRef = useRef<RunRecord | null>(null);
   activeRunRef.current = activeRun;
+  const pendingPermissionsRef = useRef<PendingPermissionRecord[]>([]);
+  pendingPermissionsRef.current = pendingPermissions;
+  const pendingElicitationsRef = useRef<PendingElicitationRecord[]>([]);
+  pendingElicitationsRef.current = pendingElicitations;
   const draftCreatedChatRef = useRef<ChatRecord | null>(null);
   draftCreatedChatRef.current = draftCreatedChat;
   const sessionOptionsRef = useRef<ParsedSessionOptions | null>(null);
@@ -1233,8 +1237,14 @@ export const App: React.FC = () => {
             )
           );
           if (evt.chatId === curChatId) {
+            if (!pendingPermissionsRef.current.some((x) => x.id === perm.id)) {
+              pendingPermissionsRef.current = [...pendingPermissionsRef.current, perm];
+            }
             setPendingPermissions((prev) =>
               prev.some((x) => x.id === perm.id) ? prev : [...prev, perm]
+            );
+            setActiveRun((cur) =>
+              cur && cur.id === perm.runId ? { ...cur, status: 'awaiting_permission' } : cur
             );
           }
           const hapticOn = Boolean(preferencesRef.current?.hapticFeedback ?? true);
@@ -1270,15 +1280,32 @@ export const App: React.FC = () => {
       case 'permission.resolved': {
         const perm = p.permission as PendingPermissionRecord | undefined;
         if (perm) {
-          setChats((prev) =>
-            prev.map((c) =>
-              c.id === perm.chatId && c.activeRun?.status === 'awaiting_permission'
-                ? { ...c, activeRun: { ...c.activeRun, status: 'running' } }
-                : c
-            )
-          );
           if (evt.chatId === curChatId) {
+            pendingPermissionsRef.current = pendingPermissionsRef.current.filter(
+              (x) => x.id !== perm.id
+            );
             setPendingPermissions((prev) => prev.filter((x) => x.id !== perm.id));
+          }
+          const stillPendingForRun =
+            Boolean(p.hasPendingForRun) ||
+            (evt.chatId === curChatId &&
+              (pendingPermissionsRef.current.some((x) => x.runId === perm.runId) ||
+                pendingElicitationsRef.current.some((x) => x.runId === perm.runId)));
+          if (!stillPendingForRun) {
+            setChats((prev) =>
+              prev.map((c) =>
+                c.id === perm.chatId && c.activeRun?.status === 'awaiting_permission'
+                  ? { ...c, activeRun: { ...c.activeRun, status: 'running' } }
+                  : c
+              )
+            );
+            if (evt.chatId === curChatId) {
+              setActiveRun((cur) =>
+                cur && cur.id === perm.runId && cur.status === 'awaiting_permission'
+                  ? { ...cur, status: 'running' }
+                  : cur
+              );
+            }
           }
         }
         break;
@@ -1294,8 +1321,14 @@ export const App: React.FC = () => {
             )
           );
           if (evt.chatId === curChatId) {
+            if (!pendingElicitationsRef.current.some((x) => x.id === elicit.id)) {
+              pendingElicitationsRef.current = [...pendingElicitationsRef.current, elicit];
+            }
             setPendingElicitations((prev) =>
               prev.some((x) => x.id === elicit.id) ? prev : [...prev, elicit]
+            );
+            setActiveRun((cur) =>
+              cur && cur.id === elicit.runId ? { ...cur, status: 'awaiting_permission' } : cur
             );
           }
           const hapticOn = Boolean(preferencesRef.current?.hapticFeedback ?? true);
@@ -1328,15 +1361,32 @@ export const App: React.FC = () => {
       case 'elicitation.resolved': {
         const elicit = p.elicitation as PendingElicitationRecord | undefined;
         if (elicit) {
-          setChats((prev) =>
-            prev.map((c) =>
-              c.id === elicit.chatId && c.activeRun?.status === 'awaiting_permission'
-                ? { ...c, activeRun: { ...c.activeRun, status: 'running' } }
-                : c
-            )
-          );
           if (evt.chatId === curChatId) {
+            pendingElicitationsRef.current = pendingElicitationsRef.current.filter(
+              (x) => x.id !== elicit.id
+            );
             setPendingElicitations((prev) => prev.filter((x) => x.id !== elicit.id));
+          }
+          const stillPendingForRun =
+            Boolean(p.hasPendingForRun) ||
+            (evt.chatId === curChatId &&
+              (pendingPermissionsRef.current.some((x) => x.runId === elicit.runId) ||
+                pendingElicitationsRef.current.some((x) => x.runId === elicit.runId)));
+          if (!stillPendingForRun) {
+            setChats((prev) =>
+              prev.map((c) =>
+                c.id === elicit.chatId && c.activeRun?.status === 'awaiting_permission'
+                  ? { ...c, activeRun: { ...c.activeRun, status: 'running' } }
+                  : c
+              )
+            );
+            if (evt.chatId === curChatId) {
+              setActiveRun((cur) =>
+                cur && cur.id === elicit.runId && cur.status === 'awaiting_permission'
+                  ? { ...cur, status: 'running' }
+                  : cur
+              );
+            }
           }
         }
         break;
