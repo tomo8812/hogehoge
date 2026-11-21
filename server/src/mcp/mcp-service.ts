@@ -1217,6 +1217,12 @@ export class McpService {
   ): void {
     const currentDirs = this.resolveTargetProfileDirs(row.scope, row.ownerUserId);
     const effectiveAlwaysAllow = this.computeEffectiveAlwaysAllowTools(row);
+    const effectiveSet = new Set(effectiveAlwaysAllow);
+    const prevEffective = previousRow ? this.computeEffectiveAlwaysAllowTools(previousRow) : [];
+    const revokeTools = [
+      ...prevEffective.filter((tool) => !effectiveSet.has(tool)),
+      ...parseArgsJson(row.disabledToolsJson),
+    ];
 
     this.db.withAgyProfileSettingsWrite(() => {
       if (
@@ -1230,6 +1236,7 @@ export class McpService {
           profileDirs: prevDirs,
           serverName: previousRow.name,
           alwaysAllowTools: [],
+          removeAllForServer: true,
         });
       }
 
@@ -1238,6 +1245,8 @@ export class McpService {
         serverName: row.name,
         previousServerName: previousRow?.name ?? null,
         alwaysAllowTools: effectiveAlwaysAllow,
+        revokeTools,
+        removeAllForServer: !row.enabled,
       });
     });
   }
@@ -1252,6 +1261,8 @@ export class McpService {
           profileDirs: [profileDir],
           serverName: row.name,
           alwaysAllowTools: this.computeEffectiveAlwaysAllowTools(row),
+          revokeTools: parseArgsJson(row.disabledToolsJson),
+          removeAllForServer: !row.enabled,
         });
       }
     });
@@ -1317,20 +1328,23 @@ export class McpService {
 
     const storedAlwaysAllow = parseArgsJson(row.alwaysAllowToolsJson);
     const alwaysAllowSet = new Set(storedAlwaysAllow);
-    // Also reflect any mcp(server/tool) rules present in the owner/admin profile's settings.json
-    const checkDirs = this.resolveTargetProfileDirs(row.scope, row.ownerUserId);
-    const prefix = `mcp(${row.name}/`;
-    for (const dir of checkDirs.slice(0, 1)) {
-      try {
-        const rules = getAgyPermissionRules(dir, { createIfMissing: false });
-        for (const allowRule of rules.allow) {
-          if (allowRule.startsWith(prefix) && allowRule.endsWith(')')) {
-            const toolName = allowRule.slice(prefix.length, -1).trim();
-            if (toolName) alwaysAllowSet.add(toolName);
+    // For profile-scoped servers, reflect any mcp(server/tool) rules in the owner's settings.json.
+    // Shared servers keep the shared DB policy authoritative so one user's chat rule isn't promoted server-wide.
+    if (row.scope === 'profile' && row.ownerUserId) {
+      const checkDirs = this.resolveTargetProfileDirs(row.scope, row.ownerUserId);
+      const prefix = `mcp(${row.name}/`;
+      for (const dir of checkDirs) {
+        try {
+          const rules = getAgyPermissionRules(dir, { createIfMissing: false });
+          for (const allowRule of rules.allow) {
+            if (allowRule.startsWith(prefix) && allowRule.endsWith(')')) {
+              const toolName = allowRule.slice(prefix.length, -1).trim();
+              if (toolName) alwaysAllowSet.add(toolName);
+            }
           }
+        } catch {
+          // ignore read error
         }
-      } catch {
-        // ignore read error
       }
     }
 
@@ -1677,6 +1691,7 @@ export class McpService {
           profileDirs: targetDirs,
           serverName: existing.name,
           alwaysAllowTools: [],
+          removeAllForServer: true,
         });
       });
       this.emitUpdated(existing.scope, existing.ownerUserId, existing.id);

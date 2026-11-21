@@ -1682,6 +1682,26 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
 
     srv.ctx.mcpService.recordToolAlwaysAllowFromChat(adminUserId, 'admin-profile-mcp', 'safe_tool');
     expect(JSON.parse(srv.ctx.db.getMcpServerById(profileId)!.alwaysAllowToolsJson)).toEqual(['safe_tool']);
+
+    // Personal chat allow rule on a shared server stays in member's settings.json without leaking into shared toPublicRecord
+    const { addAgyAllowPermissionRule } = await import('../src/acp/profile-settings.js');
+    const memberProfile = srv.ctx.db.getAgyProfile(memberUserId)!;
+    addAgyAllowPermissionRule(memberProfile.profileDir, 'mcp(pre-discovery-shared/safe_tool)');
+
+    const adminList = await admin.request<{ servers: Array<{ id: string; alwaysAllowTools: string[] }> }>(
+      'GET',
+      '/api/mcp/servers'
+    );
+    const sharedFromApi = adminList.data.servers.find((s) => s.id === sharedId);
+    expect(sharedFromApi?.alwaysAllowTools).toEqual([]);
+
+    // Admin PATCH or startup sync preserves member's personal chat allow rule on pre-discovery-shared
+    const patchShared = await admin.request('PATCH', `/api/mcp/servers/${sharedId}`, {
+      description: 'Updated description',
+    });
+    expect(patchShared.status).toBe(200);
+    srv.ctx.mcpService.syncAllSharedMcpPermissionsToProfile(memberProfile.profileDir);
+    expect(getAgyPermissionRules(memberProfile.profileDir).allow).toContain('mcp(pre-discovery-shared/safe_tool)');
   });
 });
 

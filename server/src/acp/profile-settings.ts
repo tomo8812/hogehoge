@@ -284,6 +284,8 @@ export function syncMcpServerAlwaysAllowRules(params: {
   serverName: string;
   previousServerName?: string | null;
   alwaysAllowTools: string[];
+  revokeTools?: string[];
+  removeAllForServer?: boolean;
 }): void {
   const prefixCurrent = `mcp(${params.serverName.trim()}/`;
   const prefixPrev =
@@ -291,18 +293,30 @@ export function syncMcpServerAlwaysAllowRules(params: {
       ? `mcp(${params.previousServerName.trim()}/`
       : null;
 
-  const desiredRules = params.alwaysAllowTools
-    .map((tool) => tool.trim())
-    .filter((tool) => tool.length > 0 && !/[\r\n\0)]/.test(tool))
-    .map((tool) => formatMcpPermissionRule(params.serverName, tool));
+  const desiredRules = params.removeAllForServer
+    ? []
+    : params.alwaysAllowTools
+        .map((tool) => tool.trim())
+        .filter((tool) => tool.length > 0 && !/[\r\n\0)]/.test(tool))
+        .map((tool) => formatMcpPermissionRule(params.serverName, tool));
   const desiredSet = new Set(desiredRules);
+
+  const revokeSet = new Set(
+    (params.revokeTools ?? [])
+      .map((tool) => tool.trim())
+      .filter((tool) => tool.length > 0 && !/[\r\n\0)]/.test(tool))
+      .map((tool) => formatMcpPermissionRule(params.serverName, tool))
+      .filter((rule) => !desiredSet.has(rule))
+  );
 
   for (const profileDir of params.profileDirs) {
     if (!profileDir) continue;
     updateAgyPermissionRules(profileDir, (current) => {
       const filteredAllow = current.allow.filter((rule) => {
-        if (rule.startsWith(prefixCurrent) && rule.endsWith(')')) return false;
         if (prefixPrev && rule.startsWith(prefixPrev) && rule.endsWith(')')) return false;
+        if (params.removeAllForServer && rule.startsWith(prefixCurrent) && rule.endsWith(')')) return false;
+        if (revokeSet.has(rule)) return false;
+        if (desiredSet.has(rule)) return false;
         return true;
       });
       const filteredAsk = current.ask.filter((rule) => !desiredSet.has(rule));
