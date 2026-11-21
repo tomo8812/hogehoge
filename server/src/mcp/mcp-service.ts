@@ -3074,19 +3074,27 @@ export class McpService {
           const status = res.statusCode ?? 0;
           if (status === 401) {
             res.resume();
-            void this.discoverOAuthMetadata(sseUrl).then((discovered) => {
-              finish({
-                ok: false,
-                status: 'oauth_required',
-                message: '認証が必要です (HTTP 401)。OAuth認証または認証ヘッダーを設定してください。',
-                discoveredOAuth: {
-                  authorizationUrl: discovered.authorizationUrl,
-                  tokenUrl: discovered.tokenUrl,
-                  registrationUrl: discovered.registrationUrl,
-                  scopes: discovered.scopes,
-                },
+            void this.discoverOAuthMetadata(sseUrl)
+              .then((discovered) => {
+                finish({
+                  ok: false,
+                  status: 'oauth_required',
+                  message: '認証が必要です (HTTP 401)。OAuth認証または認証ヘッダーを設定してください。',
+                  discoveredOAuth: {
+                    authorizationUrl: discovered.authorizationUrl,
+                    tokenUrl: discovered.tokenUrl,
+                    registrationUrl: discovered.registrationUrl,
+                    scopes: discovered.scopes,
+                  },
+                });
+              })
+              .catch(() => {
+                finish({
+                  ok: false,
+                  status: 'oauth_required',
+                  message: '認証が必要です (HTTP 401)。OAuth認証または認証ヘッダーを設定してください。',
+                });
               });
-            });
             return;
           }
           if (status < 200 || status >= 300) {

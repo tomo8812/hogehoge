@@ -685,8 +685,12 @@ const ElicitationCard: React.FC<{
       if (prop.type === 'boolean') {
         if (typeof prop.default === 'boolean') init[key] = prop.default;
       } else if (prop.type === 'array') {
-        if (Array.isArray(prop.default)) init[key] = prop.default.map(String);
-        else init[key] = [];
+        const hasEnumChoices = normalizeElicitationChoices(prop).length > 0;
+        if (hasEnumChoices) {
+          init[key] = Array.isArray(prop.default) ? prop.default.map(String) : [];
+        } else {
+          init[key] = Array.isArray(prop.default) ? prop.default.map(String).join('\n') : '';
+        }
       } else if (prop.type === 'number' || prop.type === 'integer') {
         if (typeof prop.default === 'number' && Number.isFinite(prop.default)) {
           init[key] = String(prop.default);
@@ -754,18 +758,25 @@ const ElicitationCard: React.FC<{
       }
 
       if (prop.type === 'array') {
-        const arr = Array.isArray(rawVal) ? rawVal : [];
+        const arr = Array.isArray(rawVal)
+          ? rawVal
+          : typeof rawVal === 'string'
+            ? rawVal
+                .split(/\r?\n/)
+                .map((s) => s.trim())
+                .filter(Boolean)
+            : [];
         const arrProp = prop as Extract<ElicitationPropertySchema, { type: 'array' }>;
         if (isReq && arr.length === 0) {
-          setNotice(`「${label}」を1つ以上選択してください。`);
+          setNotice(`「${label}」を1つ以上入力または選択してください。`);
           return;
         }
         if (arrProp.minItems != null && arr.length > 0 && arr.length < arrProp.minItems) {
-          setNotice(`「${label}」は${arrProp.minItems}件以上選択してください。`);
+          setNotice(`「${label}」は${arrProp.minItems}件以上にしてください。`);
           return;
         }
         if (arrProp.maxItems != null && arr.length > arrProp.maxItems) {
-          setNotice(`「${label}」は${arrProp.maxItems}件以内で選択してください。`);
+          setNotice(`「${label}」は${arrProp.maxItems}件以内にしてください。`);
           return;
         }
         if (arr.length > 0 || isReq) {
@@ -952,6 +963,28 @@ const ElicitationCard: React.FC<{
             }
 
             if (prop.type === 'array') {
+              if (choices.length === 0) {
+                const textVal = typeof formValues[key] === 'string' ? (formValues[key] as string) : '';
+                return (
+                  <div key={key} className="question-field">
+                    <label className="question-field-label" htmlFor={`elicit-${elicit.id}-${key}`}>
+                      <span>{label}</span>
+                      {isReq && <span className="question-required-mark">必須</span>}
+                    </label>
+                    {desc && <div className="question-field-desc">{desc}</div>}
+                    <textarea
+                      id={`elicit-${elicit.id}-${key}`}
+                      rows={3}
+                      disabled={busy}
+                      className="question-textarea"
+                      placeholder="1行に1項目ずつ入力してください"
+                      value={textVal}
+                      onChange={(e) => setFormValues((prev) => ({ ...prev, [key]: e.target.value }))}
+                    />
+                  </div>
+                );
+              }
+
               const selectedArr = Array.isArray(formValues[key]) ? (formValues[key] as string[]) : [];
               return (
                 <fieldset key={key} className="question-field">
