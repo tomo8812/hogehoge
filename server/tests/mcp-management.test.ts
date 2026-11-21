@@ -1581,6 +1581,108 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
     expect(getAgyPermissionRules(memberProfile.profileDir).allow).not.toContain('mcp(perm-sync-mcp/tool_alpha)');
     expect(getAgyPermissionRules(lateProfile.profileDir).allow).not.toContain('mcp(perm-sync-mcp/tool_alpha)');
   });
+
+  it('enforces disabledTools before tool discovery and prevents non-owners from mutating shared alwaysAllowTools from chat', async () => {
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+
+    const mockHttpMcp = http.createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(Buffer.from(c));
+      const rpc = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+        id?: number | string;
+        method: string;
+        params?: { name?: string };
+      };
+      if (rpc.method === 'initialize') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'pre-disc-mcp', version: '1.0' } },
+        }));
+        return;
+      }
+      if (rpc.method === 'notifications/initialized') {
+        res.writeHead(202).end();
+        return;
+      }
+      if (rpc.method === 'tools/list') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          result: {
+            tools: [
+              { name: 'safe_tool', description: 'Safe tool' },
+              { name: 'danger_tool', description: 'Dangerous tool' },
+            ],
+          },
+        }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => mockHttpMcp.listen(0, '127.0.0.1', resolve));
+    httpServers.push(mockHttpMcp);
+    const port = (mockHttpMcp.address() as { port: number }).port;
+    const upstreamUrl = `http://127.0.0.1:${port}`;
+
+    const { client: admin, userId: adminUserId } = await registerAndBindAgy(srv.baseUrl, 'admin', 'user:admin@gmail.com');
+    const { client: member, userId: memberUserId } = await registerAndBindAgy(srv.baseUrl, 'member', 'user:member@gmail.com');
+
+    // Create shared MCP with disabledTools BEFORE any discovery (discoveredToolsJson stays '[]')
+    const sharedCreate = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'pre-discovery-shared',
+      scope: 'shared',
+      transport: 'http',
+      url: upstreamUrl,
+      disabledTools: ['danger_tool'],
+    });
+    expect(sharedCreate.status).toBe(201);
+    const sharedId = sharedCreate.data.server.id;
+    expect(srv.ctx.db.getMcpServerById(sharedId)?.discoveredToolsJson).toBe('[]');
+
+    const acpServers = await srv.ctx.mcpService.resolveAcpMcpServersForUser(memberUserId);
+    const acpTarget = acpServers.find((s) => s.name === 'pre-discovery-shared') as { url: string };
+    expect(acpTarget?.url).toBeTruthy();
+
+    const listResp = await fetch(acpTarget.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    });
+    const listJson = (await listResp.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(listJson.result.tools.map((t) => t.name)).toEqual(['safe_tool']);
+
+    const callDisabledResp = await fetch(acpTarget.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'danger_tool', arguments: {} } }),
+    });
+    const callDisabledJson = (await callDisabledResp.json()) as { error?: { code: number } };
+    expect(callDisabledJson.error?.code).toBe(-32602);
+
+    // Profile server owned by admin gets updated only by admin, while shared server is untouched
+    const profileCreate = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'admin-profile-mcp',
+      scope: 'profile',
+      transport: 'http',
+      url: upstreamUrl,
+    });
+    expect(profileCreate.status).toBe(201);
+    const profileId = profileCreate.data.server.id;
+
+    srv.ctx.mcpService.recordToolAlwaysAllowFromChat(memberUserId, 'pre-discovery-shared', 'safe_tool');
+    srv.ctx.mcpService.recordToolAlwaysAllowFromChat(adminUserId, 'pre-discovery-shared', 'safe_tool');
+    expect(JSON.parse(srv.ctx.db.getMcpServerById(sharedId)!.alwaysAllowToolsJson)).toEqual([]);
+
+    srv.ctx.mcpService.recordToolAlwaysAllowFromChat(memberUserId, 'admin-profile-mcp', 'safe_tool');
+    expect(JSON.parse(srv.ctx.db.getMcpServerById(profileId)!.alwaysAllowToolsJson)).toEqual([]);
+
+    srv.ctx.mcpService.recordToolAlwaysAllowFromChat(adminUserId, 'admin-profile-mcp', 'safe_tool');
+    expect(JSON.parse(srv.ctx.db.getMcpServerById(profileId)!.alwaysAllowToolsJson)).toEqual(['safe_tool']);
+  });
 });
 
 

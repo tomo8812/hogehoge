@@ -67,10 +67,22 @@ export type ClientJsonRpcInspectResult =
       localToolsListIds: Set<string>;
     };
 
+export function isMcpToolPermitted(
+  toolName: string,
+  allowedTools?: ReadonlySet<string> | null,
+  disabledTools?: ReadonlySet<string> | null
+): boolean {
+  if (!toolName) return false;
+  if (disabledTools && disabledTools.has(toolName)) return false;
+  if (allowedTools && !allowedTools.has(toolName)) return false;
+  return true;
+}
+
 export function inspectMcpClientJsonRpcPayload(
   rawBody: string,
-  allowedTools: ReadonlySet<string>,
-  trackedToolsListIds?: Set<string>
+  allowedTools?: ReadonlySet<string> | null,
+  trackedToolsListIds?: Set<string>,
+  disabledTools?: ReadonlySet<string> | null
 ): ClientJsonRpcInspectResult {
   const localToolsListIds = new Set<string>();
   const trimmed = rawBody.trim();
@@ -113,7 +125,7 @@ export function inspectMcpClientJsonRpcPayload(
           ? (msg.params as Record<string, unknown>)
           : null;
       const toolName = typeof params?.name === 'string' ? params.name : '';
-      if (!toolName || !allowedTools.has(toolName)) {
+      if (!isMcpToolPermitted(toolName, allowedTools, disabledTools)) {
         changed = true;
         if (msg.id !== undefined && msg.id !== null) {
           blockedErrors.push({
@@ -121,7 +133,7 @@ export function inspectMcpClientJsonRpcPayload(
             id: msg.id,
             error: {
               code: -32602,
-              message: `Tool "${toolName || '(unknown)'}" is not permitted by allowedTools policy`,
+              message: `Tool "${toolName || '(unknown)'}" is not permitted by tool policy`,
             },
           });
         }
@@ -153,9 +165,10 @@ export function inspectMcpClientJsonRpcPayload(
 
 export function filterMcpServerJsonRpcPayload(
   payload: unknown,
-  allowedTools: ReadonlySet<string>,
+  allowedTools: ReadonlySet<string> | null | undefined,
   activeToolsListIds: Set<string>,
-  forceToolsList = false
+  forceToolsList = false,
+  disabledTools?: ReadonlySet<string> | null
 ): { changed: boolean; value: unknown } {
   if (!payload || typeof payload !== 'object') {
     return { changed: false, value: payload };
@@ -184,7 +197,7 @@ export function filterMcpServerJsonRpcPayload(
     const filteredTools = result.tools.filter((tool) => {
       if (!tool || typeof tool !== 'object' || Array.isArray(tool)) return false;
       const toolName = (tool as Record<string, unknown>).name;
-      return typeof toolName === 'string' && allowedTools.has(toolName);
+      return typeof toolName === 'string' && isMcpToolPermitted(toolName, allowedTools, disabledTools);
     });
     return {
       changed: true,
@@ -245,6 +258,7 @@ export function extractMcpToolsFromJsonRpcPayload(payload: unknown): McpDiscover
 
 export function createSseMcpToolFilterTransform(opts: {
   allowedTools?: ReadonlySet<string> | null;
+  disabledTools?: ReadonlySet<string> | null;
   trackedToolsListIds?: Set<string>;
   localToolsListIds?: Set<string>;
   routeToken?: string;
@@ -289,7 +303,7 @@ export function createSseMcpToolFilterTransform(opts: {
       return `${lines.join('\n')}\n\n`;
     }
 
-    if (opts.allowedTools != null && dataPayloads.length > 0) {
+    if ((opts.allowedTools != null || opts.disabledTools != null) && dataPayloads.length > 0) {
       const rawJson = dataPayloads.join('\n').trim();
       if (rawJson.startsWith('{') || rawJson.startsWith('[')) {
         try {
@@ -301,7 +315,8 @@ export function createSseMcpToolFilterTransform(opts: {
               value,
               opts.allowedTools,
               opts.localToolsListIds,
-              false
+              false,
+              opts.disabledTools
             );
             changed = res.changed;
             value = res.value;
@@ -311,7 +326,8 @@ export function createSseMcpToolFilterTransform(opts: {
               value,
               opts.allowedTools,
               opts.trackedToolsListIds,
-              false
+              false,
+              opts.disabledTools
             );
             changed = res.changed;
             value = res.value;
@@ -386,8 +402,16 @@ const { spawn } = require('node:child_process');
 const { StringDecoder } = require('node:string_decoder');
 
 const cfg = JSON.parse(process.argv[1] || '{}');
-const allowed = new Set(Array.isArray(cfg.allowedTools) ? cfg.allowedTools : []);
+const allowed = Array.isArray(cfg.allowedTools) ? new Set(cfg.allowedTools) : null;
+const disabled = Array.isArray(cfg.disabledTools) ? new Set(cfg.disabledTools) : null;
 const listIds = new Set();
+
+function isPermitted(name) {
+  if (typeof name !== 'string' || !name) return false;
+  if (disabled && disabled.has(name)) return false;
+  if (allowed && !allowed.has(name)) return false;
+  return true;
+}
 
 function idKey(id) {
   return typeof id === 'string' || typeof id === 'number' ? JSON.stringify(id) : null;
@@ -434,7 +458,7 @@ function handleClientLine(rawLine) {
     }
     if (item.method === 'tools/call') {
       const toolName = item.params && typeof item.params === 'object' ? item.params.name : '';
-      if (typeof toolName !== 'string' || !allowed.has(toolName)) {
+      if (!isPermitted(toolName)) {
         changed = true;
         if (item.id !== undefined && item.id !== null) {
           process.stdout.write(JSON.stringify({
@@ -442,7 +466,7 @@ function handleClientLine(rawLine) {
             id: item.id,
             error: {
               code: -32602,
-              message: 'Tool "' + String(toolName || '(unknown)') + '" is not permitted by allowedTools policy',
+              message: 'Tool "' + String(toolName || '(unknown)') + '" is not permitted by tool policy',
             },
           }) + '\\n');
         }
@@ -486,7 +510,7 @@ function handleServerLine(rawLine) {
       ...item,
       result: {
         ...item.result,
-        tools: item.result.tools.filter((t) => t && typeof t === 'object' && typeof t.name === 'string' && allowed.has(t.name)),
+        tools: item.result.tools.filter((t) => t && typeof t === 'object' && isPermitted(t.name)),
       },
     };
   });

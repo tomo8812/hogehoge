@@ -676,6 +676,7 @@ async function fetchJsonWithTimeout(
 
 interface ForwardedMcpTarget extends PinnedOutboundTarget {
   allowedTools?: ReadonlySet<string>;
+  disabledTools?: ReadonlySet<string>;
   trackedToolsListIds?: Set<string>;
   activeSseResponses?: Set<http.ServerResponse>;
 }
@@ -786,6 +787,8 @@ class PinnedHttpsForwarder {
       ? `${resolvedExtraPath}${mergedQuery}`
       : `${target.parsed.pathname === '/' && resolvedExtraPath ? '' : target.parsed.pathname}${resolvedExtraPath}${mergedQuery}`;
 
+    const filterActive =
+      target.allowedTools !== undefined || target.disabledTools !== undefined;
     const outHeaders: Record<string, string | string[]> = {};
     for (const [k, v] of Object.entries(req.headers)) {
       if (v === undefined) continue;
@@ -793,14 +796,13 @@ class PinnedHttpsForwarder {
       if (lower === 'host' || lower === 'connection' || lower === 'keep-alive' || lower === 'proxy-connection') {
         continue;
       }
-      if (target.allowedTools !== undefined && lower === 'accept-encoding') {
+      if (filterActive && lower === 'accept-encoding') {
         continue;
       }
       outHeaders[k] = v;
     }
     outHeaders.host = target.parsed.host;
 
-    const filterActive = target.allowedTools !== undefined;
     if (filterActive) {
       outHeaders['accept-encoding'] = 'identity';
     }
@@ -809,7 +811,7 @@ class PinnedHttpsForwarder {
     let localToolsListIds = new Set<string>();
     let blockedBatchErrors: Record<string, unknown>[] = [];
 
-    if (filterActive && req.method === 'POST' && target.allowedTools) {
+    if (filterActive && req.method === 'POST') {
       try {
         requestBodyBuf = await readIncomingBody(req);
       } catch (err) {
@@ -823,8 +825,9 @@ class PinnedHttpsForwarder {
 
       const inspectRes = inspectMcpClientJsonRpcPayload(
         requestBodyBuf.toString('utf8'),
-        target.allowedTools,
-        target.trackedToolsListIds
+        target.allowedTools ?? null,
+        target.trackedToolsListIds,
+        target.disabledTools ?? null
       );
       if (inspectRes.kind === 'reject_all') {
         const respBuf = Buffer.from(inspectRes.responseBody, 'utf8');
@@ -872,7 +875,7 @@ class PinnedHttpsForwarder {
         return;
       }
 
-      if (!filterActive || !target.allowedTools) {
+      if (!filterActive) {
         res.writeHead(status, upRes.headers);
         upRes.pipe(res);
         return;
@@ -898,7 +901,8 @@ class PinnedHttpsForwarder {
         }
         const { stream } = createDecodedResponseStream(upRes);
         const sseFilter = createSseMcpToolFilterTransform({
-          allowedTools: target.allowedTools,
+          allowedTools: target.allowedTools ?? null,
+          disabledTools: target.disabledTools ?? null,
           trackedToolsListIds: target.trackedToolsListIds,
           localToolsListIds,
           routeToken: token,
@@ -934,9 +938,10 @@ class PinnedHttpsForwarder {
               const forceList = localToolsListIds.size > 0 && blockedBatchErrors.length === 0;
               const filtered = filterMcpServerJsonRpcPayload(
                 parsed,
-                target.allowedTools!,
+                target.allowedTools ?? null,
                 combinedIds,
-                forceList
+                forceList,
+                target.disabledTools ?? null
               );
               let finalValue = filtered.value;
               if (filtered.changed) {
@@ -1256,7 +1261,9 @@ export class McpService {
     const cleanServer = serverName.trim();
     const cleanTool = toolName.trim();
     if (!cleanServer || !cleanTool) return;
-    const rows = this.db.listEffectiveMcpServersForUser(userId).filter((r) => r.name === cleanServer);
+    const rows = this.db
+      .listEffectiveMcpServersForUser(userId)
+      .filter((r) => r.name === cleanServer && r.scope === 'profile' && r.ownerUserId === userId);
     for (const row of rows) {
       const curAlways = parseArgsJson(row.alwaysAllowToolsJson);
       if (!curAlways.includes(cleanTool)) {
@@ -3395,20 +3402,26 @@ export class McpService {
     }
   }
 
-  private resolveEffectiveAllowedTools(row: StoredMcpServerRow): string[] | null {
+  private resolveEffectiveToolPolicy(row: StoredMcpServerRow): {
+    allowedTools: string[] | null;
+    disabledTools: string[] | null;
+  } | null {
     const allowedTools = parseArgsJson(row.allowedToolsJson);
     const disabledTools = parseArgsJson(row.disabledToolsJson);
     const disabledSet = new Set(disabledTools);
 
     if (allowedTools.length > 0) {
-      return allowedTools.filter((name) => !disabledSet.has(name));
+      return {
+        allowedTools: allowedTools.filter((name) => !disabledSet.has(name)),
+        disabledTools: null,
+      };
     }
 
     if (disabledTools.length > 0) {
-      const discovered = parseDiscoveredToolsJson(row.discoveredToolsJson);
-      if (discovered.length > 0) {
-        return discovered.map((t) => t.name).filter((name) => !disabledSet.has(name));
-      }
+      return {
+        allowedTools: null,
+        disabledTools,
+      };
     }
 
     return null;
@@ -3442,7 +3455,7 @@ export class McpService {
     const out: McpServer[] = [];
 
     for (const row of byName.values()) {
-      const effectiveAllowedTools = this.resolveEffectiveAllowedTools(row);
+      const toolPolicy = this.resolveEffectiveToolPolicy(row);
 
       if (row.transport === 'stdio') {
         if (!row.command) continue;
@@ -3451,7 +3464,7 @@ export class McpService {
         const envMap = this.decryptRecord(row.encryptedEnvJson);
         const env = Object.entries(envMap).map(([name, value]) => ({ name, value }));
 
-        if (effectiveAllowedTools !== null) {
+        if (toolPolicy !== null) {
           const nodeBin = resolveHostExecutable('node') ?? process.execPath;
           out.push({
             name: row.name,
@@ -3463,7 +3476,8 @@ export class McpService {
               JSON.stringify({
                 command: resolvedCmd,
                 args,
-                allowedTools: effectiveAllowedTools,
+                ...(toolPolicy.allowedTools ? { allowedTools: toolPolicy.allowedTools } : {}),
+                ...(toolPolicy.disabledTools ? { disabledTools: toolPolicy.disabledTools } : {}),
               }),
             ],
             env,
@@ -3496,12 +3510,12 @@ export class McpService {
       const headerMap = this.decryptRecord(row.encryptedHeadersJson);
 
       let acpUrl = target.url;
-      const hasAllowedToolsFilter = effectiveAllowedTools !== null;
 
-      if (hasAllowedToolsFilter) {
+      if (toolPolicy !== null) {
         acpUrl = await this.httpsForwarder.registerRoute({
           ...target,
-          allowedTools: new Set(effectiveAllowedTools),
+          ...(toolPolicy.allowedTools ? { allowedTools: new Set(toolPolicy.allowedTools) } : {}),
+          ...(toolPolicy.disabledTools ? { disabledTools: new Set(toolPolicy.disabledTools) } : {}),
           trackedToolsListIds: new Set(),
           activeSseResponses: new Set(),
         });

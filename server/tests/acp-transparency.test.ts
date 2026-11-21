@@ -804,6 +804,31 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
     srv.ctx.db.recoverInterruptedRuns();
     expect(srv.ctx.db.getElicitation(userId, 'elicit-recover-1')?.status).toBe('cancelled');
 
+    // 6) Selecting a reject option with alwaysAllow=true must NOT persist alwaysAllowRule
+    const rejectRun = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: 'Reject [PERMISSION]',
+    });
+    const rPermFrame = await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; runId: string }).type === 'permission.requested' &&
+        (f.event as { runId: string }).runId === rejectRun.data.run.id
+    );
+    const rPermId = (rPermFrame.event as { payload: { permission: { id: string } } }).payload.permission.id;
+    const rejectRes = await alice.request('POST', `/api/chats/${chatId}/permissions/${rPermId}`, {
+      optionId: 'reject_once',
+      alwaysAllow: true,
+    });
+    expect(rejectRes.status).toBe(200);
+    await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === rejectRun.data.run.id
+    );
+    const profileAfterReject = srv.ctx.db.getAgyProfile(userId)!;
+    expect(getAgyPermissionRules(profileAfterReject.profileDir).allow).not.toContain('write_file(created-by-tool.md)');
+
     alice.closeWs();
   });
 });

@@ -1062,8 +1062,16 @@ export class AcpClientManager {
       return null;
     }
 
+    const explicitlyRequestedOption =
+      !params.cancel && params.selectedOptionId
+        ? existing.options.find((o) => o.optionId === params.selectedOptionId) ?? null
+        : null;
+    const explicitNonAllow = Boolean(
+      explicitlyRequestedOption && !explicitlyRequestedOption.kind.startsWith('allow')
+    );
+
     let effectiveOptionId = params.cancel ? null : params.selectedOptionId;
-    if (!params.cancel && params.alwaysAllow) {
+    if (!params.cancel && params.alwaysAllow && !explicitNonAllow) {
       const nativeAlwaysOpt = existing.options.find((o) => o.kind === 'allow_always');
       const allowOnceOpt = existing.options.find((o) => o.kind.startsWith('allow'));
       if (nativeAlwaysOpt) {
@@ -1076,9 +1084,11 @@ export class AcpClientManager {
     const chosenOption = effectiveOptionId
       ? existing.options.find((o) => o.optionId === effectiveOptionId) ?? null
       : null;
+    const isChosenAllow = Boolean(chosenOption && chosenOption.kind.startsWith('allow'));
     const isAlwaysAllow =
       !params.cancel &&
-      Boolean(params.alwaysAllow || chosenOption?.kind === 'allow_always');
+      isChosenAllow &&
+      (chosenOption?.kind === 'allow_always' || Boolean(params.alwaysAllow));
 
     const status = params.cancel ? 'cancelled' : 'resolved';
     const updated = this.db.resolvePermissionAtomically({
