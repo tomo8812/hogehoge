@@ -425,6 +425,7 @@ export class PushNotificationService {
     runId: string;
     permissionId: string;
     toolTitle?: string | null;
+    isQuestion?: boolean;
   }): Promise<SendToUserResult | null> {
     const prefs = this.db.getPreferences(params.userId);
     if (!prefs.notifyOnResponse) return null;
@@ -432,16 +433,51 @@ export class PushNotificationService {
     const chat = this.db.getChat(params.userId, params.chatId);
     const chatTitle = chat?.title || 'Antigravity Chat';
     const cleanTitle = chatTitle.length > 52 ? `${chatTitle.slice(0, 51)}…` : chatTitle;
-    const toolLabel = truncatePreview(params.toolTitle || undefined, 90) || 'ツール実行の許可';
+    const isQuestion = Boolean(params.isQuestion);
+    const label =
+      truncatePreview(params.toolTitle || undefined, 90) ||
+      (isQuestion ? 'エージェントからの質問' : 'ツール実行の許可');
     const vibratePermission = prefs.hapticFeedback ? [24, 60, 24] : undefined;
 
     const skipEndpoints = this.hub?.getVisiblePushEndpoints(params.userId);
     return this.sendToUser(
       params.userId,
       {
-        title: `確認待ち — ${cleanTitle}`,
-        body: `${toolLabel} の承認が必要です。`,
+        title: `${isQuestion ? '質問待ち' : '確認待ち'} — ${cleanTitle}`,
+        body: isQuestion ? label : `${label} の承認が必要です。`,
         tag: `perm-${params.permissionId}`,
+        chatId: params.chatId,
+        runId: params.runId,
+        url: `/?chatId=${encodeURIComponent(params.chatId)}`,
+        ...(vibratePermission ? { vibrate: vibratePermission } : {}),
+      },
+      { skipEndpoints }
+    );
+  }
+
+  async notifyElicitationRequested(params: {
+    userId: string;
+    chatId: string;
+    runId: string;
+    elicitationId: string;
+    message?: string | null;
+  }): Promise<SendToUserResult | null> {
+    const prefs = this.db.getPreferences(params.userId);
+    if (!prefs.notifyOnResponse) return null;
+
+    const chat = this.db.getChat(params.userId, params.chatId);
+    const chatTitle = chat?.title || 'Antigravity Chat';
+    const cleanTitle = chatTitle.length > 52 ? `${chatTitle.slice(0, 51)}…` : chatTitle;
+    const label = truncatePreview(params.message || undefined, 90) || 'エージェントからの質問';
+    const vibratePermission = prefs.hapticFeedback ? [24, 60, 24] : undefined;
+
+    const skipEndpoints = this.hub?.getVisiblePushEndpoints(params.userId);
+    return this.sendToUser(
+      params.userId,
+      {
+        title: `質問待ち — ${cleanTitle}`,
+        body: label,
+        tag: `elicit-${params.elicitationId}`,
         chatId: params.chatId,
         runId: params.runId,
         url: `/?chatId=${encodeURIComponent(params.chatId)}`,

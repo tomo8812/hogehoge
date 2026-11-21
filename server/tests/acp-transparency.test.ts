@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { deriveAgyPermissionRule } from '../src/acp/client-manager.js';
+import { getAgyPermissionRules } from '../src/acp/profile-settings.js';
 import type { AcpConfigOption, MessageRecord } from '../src/types.js';
 import { PathContainmentError, resolveContainedWriteTarget, supportsWorkspaceTextWrites, writeWorkspaceTextFile } from '../src/files/workspace.js';
 import { getMessageActivity } from '../../web/src/utils/messageActivity.js';
@@ -500,4 +502,349 @@ describe('ACP transparency & Reactive Wakeup behavior (Issue #2)', () => {
 
     alice.closeWs();
   });
+
+  it('derives native Antigravity permission rules and persists Always Allow into settings.json transparently', async () => {
+    const ws = '/tmp/ws-demo';
+    expect(
+      deriveAgyPermissionRule({
+        toolCall: {
+          toolCallId: 'tc-1',
+          title: 'call_mcp_tool',
+          name: 'call_mcp_tool',
+          status: 'pending',
+          rawInput: { ServerName: 'linear', ToolName: 'create_issue' },
+        },
+        workspaceDir: ws,
+        sandboxWorkspaceRoot: '/workspace',
+      })
+    ).toBe('mcp(linear/create_issue)');
+
+    expect(
+      deriveAgyPermissionRule({
+        toolCall: {
+          toolCallId: 'tc-2',
+          title: 'mcp_my_srv_fetch',
+          name: 'mcp_my_srv_fetch',
+          status: 'pending',
+        },
+        workspaceDir: ws,
+        sandboxWorkspaceRoot: '/workspace',
+        knownMcpServerNames: ['my_srv'],
+      })
+    ).toBe('mcp(my_srv/fetch)');
+
+    expect(
+      deriveAgyPermissionRule({
+        toolCall: {
+          toolCallId: 'tc-3',
+          title: 'Run command',
+          name: 'run_command',
+          kind: 'execute',
+          status: 'pending',
+          rawInput: { CommandLine: 'git status' },
+        },
+        workspaceDir: ws,
+        sandboxWorkspaceRoot: '/workspace',
+      })
+    ).toBe('command(git status)');
+
+    expect(
+      deriveAgyPermissionRule({
+        toolCall: {
+          toolCallId: 'tc-3b',
+          title: 'Run command with parens',
+          name: 'run_command',
+          kind: 'execute',
+          status: 'pending',
+          rawInput: { CommandLine: 'node -e "console.log(1)"' },
+        },
+        workspaceDir: ws,
+        sandboxWorkspaceRoot: '/workspace',
+      })
+    ).toBeNull();
+
+    expect(
+      deriveAgyPermissionRule({
+        toolCall: {
+          toolCallId: 'tc-4',
+          title: 'Read URL',
+          name: 'read_url_content',
+          kind: 'fetch',
+          status: 'pending',
+          rawInput: { Url: 'https://docs.example.com/guide' },
+        },
+        workspaceDir: ws,
+        sandboxWorkspaceRoot: '/workspace',
+      })
+    ).toBe('read_url(docs.example.com)');
+
+    expect(
+      deriveAgyPermissionRule({
+        toolCall: {
+          toolCallId: 'interaction_abc',
+          title: 'Ask question',
+          status: 'pending',
+        },
+        workspaceDir: ws,
+        sandboxWorkspaceRoot: '/workspace',
+      })
+    ).toBeNull();
+
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+    await alice.connectWs();
+
+    const chatRes = await alice.request<{ chat: { id: string; workspaceDir: string } }>(
+      'POST',
+      '/api/chats',
+      { title: 'Always Allow Chat Test' }
+    );
+    const chatId = chatRes.data.chat.id;
+    const workspaceDir = chatRes.data.chat.workspaceDir;
+
+    await alice.request('POST', `/api/chats/${chatId}/messages`, {
+      text: 'Run [PERMISSION]',
+    });
+
+    const permFrame = await alice.waitForFrame(
+      (f) => f.kind === 'event' && (f.event as { type: string }).type === 'permission.requested'
+    );
+    const perm = (
+      permFrame.event as { payload?: { permission?: { id: string; alwaysAllowRule?: string | null } } }
+    ).payload?.permission;
+    expect(perm?.id).toBeTruthy();
+    expect(perm?.alwaysAllowRule).toBe('write_file(created-by-tool.md)');
+
+    const resolveRes = await alice.request('POST', `/api/chats/${chatId}/permissions/${perm!.id}`, {
+      optionId: 'allow_once',
+      alwaysAllow: true,
+    });
+    expect(resolveRes.status).toBe(200);
+
+    await alice.waitForFrame(
+      (f) => f.kind === 'event' && (f.event as { type: string }).type === 'run.finished'
+    );
+
+    expect(fs.existsSync(path.join(workspaceDir, 'created-by-tool.md'))).toBe(true);
+    const profile = srv.ctx.db.getAgyProfile(userId)!;
+    expect(getAgyPermissionRules(profile.profileDir).allow).toContain('write_file(created-by-tool.md)');
+
+    alice.closeWs();
+  });
+
+  it('supports interaction_* questions, ACP elicitation form/url modes, completion, cancel, and recovery', async () => {
+    const srv = await createTestServer();
+    cleanups.push(srv.cleanup);
+
+    const { client: alice, userId } = await registerAndBindAgy(srv.baseUrl, 'alice', 'user:alice@gmail.com');
+    await alice.connectWs();
+
+    const chatRes = await alice.request<{ chat: { id: string } }>('POST', '/api/chats', {
+      title: 'Question Support Test',
+    });
+    const chatId = chatRes.data.chat.id;
+
+    // 1) interaction_* question via session/request_permission
+    const qRun = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[QUESTION_INTERACTION]',
+    });
+    const qPermFrame = await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; runId: string }).type === 'permission.requested' &&
+        (f.event as { runId: string }).runId === qRun.data.run.id
+    );
+    const qPerm = (
+      qPermFrame.event as {
+        payload: {
+          permission: {
+            id: string;
+            toolCall: { toolCallId: string; title: string };
+            alwaysAllowRule?: string | null;
+          };
+        };
+      }
+    ).payload.permission;
+    expect(qPerm.toolCall.toolCallId).toBe('interaction_q1');
+    expect(qPerm.alwaysAllowRule).toBeNull();
+
+    const qAns = await alice.request('POST', `/api/chats/${chatId}/permissions/${qPerm.id}`, {
+      optionId: '2',
+    });
+    expect(qAns.status).toBe(200);
+    await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === qRun.data.run.id
+    );
+
+    // 2) ACP elicitation/create (form mode) + REST persistence + duplicate 409 check
+    const fRun = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[ELICITATION_FORM]',
+    });
+    const fReqFrame = await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; runId: string }).type === 'elicitation.requested' &&
+        (f.event as { runId: string }).runId === fRun.data.run.id
+    );
+    const fElicit = (
+      fReqFrame.event as {
+        payload: {
+          elicitation: {
+            id: string;
+            mode: string;
+            message: string;
+            requestedSchema: { properties: Record<string, unknown>; required?: string[] } | null;
+          };
+        };
+      }
+    ).payload.elicitation;
+    expect(fElicit.mode).toBe('form');
+    expect(fElicit.requestedSchema?.required).toEqual(['framework']);
+
+    const midDetail = await alice.request<{
+      pendingElicitations: Array<{ id: string }>;
+      activeRun: { status: string } | null;
+    }>('GET', `/api/chats/${chatId}`);
+    expect(midDetail.data.pendingElicitations.some((e) => e.id === fElicit.id)).toBe(true);
+    expect(midDetail.data.activeRun?.status).toBe('awaiting_permission');
+
+    const fAns = await alice.request('POST', `/api/chats/${chatId}/elicitations/${fElicit.id}`, {
+      action: 'accept',
+      content: {
+        framework: 'react',
+        features: ['ts', 'test'],
+        notes: 'App Router は不要',
+        strictMode: true,
+      },
+    });
+    expect(fAns.status).toBe(200);
+
+    // Duplicate resolution returns 409 ALREADY_RESOLVED
+    const dupAns = await alice.request('POST', `/api/chats/${chatId}/elicitations/${fElicit.id}`, {
+      action: 'decline',
+    });
+    expect(dupAns.status).toBe(409);
+
+    await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === fRun.data.run.id
+    );
+
+    // 3) ACP elicitation/create (url mode) + elicitation/complete notification
+    const uRun = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[ELICITATION_URL] [AUTO_COMPLETE_URL]',
+    });
+    await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; runId: string }).type === 'elicitation.resolved' &&
+        (f.event as { runId: string }).runId === uRun.data.run.id
+    );
+    await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === uRun.data.run.id
+    );
+
+    // 4) Cancel run while elicitation is pending
+    const cRun = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: '[ELICITATION_URL]',
+    });
+    const cReqFrame = await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; runId: string }).type === 'elicitation.requested' &&
+        (f.event as { runId: string }).runId === cRun.data.run.id
+    );
+    const cElicitId = (
+      cReqFrame.event as { payload: { elicitation: { id: string } } }
+    ).payload.elicitation.id;
+
+    const cancelRes = await alice.request('POST', `/api/chats/${chatId}/runs/${cRun.data.run.id}/cancel`, {});
+    expect(cancelRes.status).toBe(200);
+    await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === cRun.data.run.id
+    );
+    expect(srv.ctx.db.getElicitation(userId, cElicitId)?.status).toBe('cancelled');
+
+    // Verify all agent outputs in chat detail
+    const finalDetail = await alice.request<{
+      pendingElicitations: unknown[];
+      messages: Array<{ role: string; contentText: string }>;
+    }>('GET', `/api/chats/${chatId}`);
+    expect(finalDetail.data.pendingElicitations).toHaveLength(0);
+    const assistantTexts = finalDetail.data.messages
+      .filter((m) => m.role === 'assistant')
+      .map((m) => m.contentText);
+    expect(assistantTexts[0]).toContain('質問への回答: optionId=2');
+    expect(assistantTexts[1]).toContain('action=accept');
+    expect(assistantTexts[1]).toContain('"framework":"react"');
+    expect(assistantTexts[1]).toContain('capForm=true, capUrl=true');
+    expect(assistantTexts[2]).toContain('URL Elicitation結果: action=accept');
+
+    // 5) DB recovery cancels leftover pending elicitations
+    const syntheticRunId = 'run-recover-elicit';
+    srv.ctx.db.createRun({
+      id: syntheticRunId,
+      chatId,
+      userId,
+      userMessageId: 'u-rec',
+      assistantMessageId: 'a-rec',
+      status: 'awaiting_permission',
+      queuePosition: 0,
+      modelId: null,
+      effortValue: null,
+    });
+    const leftover = srv.ctx.db.createPendingElicitation({
+      id: 'elicit-recover-1',
+      runId: syntheticRunId,
+      chatId,
+      userId,
+      mode: 'form',
+      message: 'Unanswered question',
+      requestedSchema: { type: 'object', properties: {} },
+    });
+    expect(leftover.status).toBe('pending');
+    srv.ctx.db.recoverInterruptedRuns();
+    expect(srv.ctx.db.getElicitation(userId, 'elicit-recover-1')?.status).toBe('cancelled');
+
+    // 6) Selecting a reject option with alwaysAllow=true must NOT persist alwaysAllowRule
+    const rejectRun = await alice.request<{ run: { id: string } }>('POST', `/api/chats/${chatId}/messages`, {
+      text: 'Reject [PERMISSION]',
+    });
+    const rPermFrame = await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; runId: string }).type === 'permission.requested' &&
+        (f.event as { runId: string }).runId === rejectRun.data.run.id
+    );
+    const rPermId = (rPermFrame.event as { payload: { permission: { id: string } } }).payload.permission.id;
+    const rejectRes = await alice.request('POST', `/api/chats/${chatId}/permissions/${rPermId}`, {
+      optionId: 'reject_once',
+      alwaysAllow: true,
+    });
+    expect(rejectRes.status).toBe(200);
+    await alice.waitForFrame(
+      (f) =>
+        f.kind === 'event' &&
+        (f.event as { type: string; payload?: { run?: { id: string } } }).type === 'run.finished' &&
+        (f.event as { payload?: { run?: { id: string } } }).payload?.run?.id === rejectRun.data.run.id
+    );
+    const profileAfterReject = srv.ctx.db.getAgyProfile(userId)!;
+    expect(getAgyPermissionRules(profileAfterReject.profileDir).allow).not.toContain('write_file(created-by-tool.md)');
+
+    alice.closeWs();
+  });
 });
+

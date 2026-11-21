@@ -254,10 +254,24 @@ export const api = {
   resolvePermission: (
     chatId: string,
     permissionId: string,
-    payload: { optionId?: string | null; cancel?: boolean; clientId?: string }
+    payload: { optionId?: string | null; alwaysAllow?: boolean; cancel?: boolean; clientId?: string }
   ) =>
     apiFetch<{ permission: PendingPermissionRecord }>(
       `/api/chats/${chatId}/permissions/${permissionId}`,
+      { method: 'POST', body: payload }
+    ),
+
+  resolveElicitation: (
+    chatId: string,
+    elicitationId: string,
+    payload: {
+      action: 'accept' | 'decline' | 'cancel';
+      content?: Record<string, string | number | boolean | string[]> | null;
+      clientId?: string;
+    }
+  ) =>
+    apiFetch<{ elicitation: import('../types').PendingElicitationRecord }>(
+      `/api/chats/${chatId}/elicitations/${elicitationId}`,
       { method: 'POST', body: payload }
     ),
 
@@ -496,6 +510,8 @@ export const api = {
     transport: McpTransport;
     enabled?: boolean;
     allowedTools?: string[];
+    disabledTools?: string[];
+    alwaysAllowTools?: string[];
     command?: string | null;
     args?: string[];
     env?: Array<{ name: string; value?: string; keepExisting?: boolean }>;
@@ -528,6 +544,8 @@ export const api = {
       transport?: McpTransport;
       enabled?: boolean;
       allowedTools?: string[];
+      disabledTools?: string[];
+      alwaysAllowTools?: string[];
       command?: string | null;
       args?: string[];
       env?: Array<{ name: string; value?: string; keepExisting?: boolean }>;
@@ -564,7 +582,7 @@ export const api = {
     }),
 
   testMcpServer: (id: string) =>
-    apiFetch<{ result: McpTestResult }>(`/api/mcp/servers/${encodeURIComponent(id)}/test`, {
+    apiFetch<{ result: McpTestResult; server?: McpServerRecord }>(`/api/mcp/servers/${encodeURIComponent(id)}/test`, {
       method: 'POST',
       body: {},
     }),

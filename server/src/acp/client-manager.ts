@@ -16,6 +16,8 @@ import {
   type AvailableCommand,
   type ClientConnection,
   type ContentBlock,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
   type InitializeResponse,
   type LoadSessionResponse,
   type NewSessionResponse,
@@ -61,7 +63,10 @@ import type {
   AttachmentRef,
   AvailableCommandItem,
   ChatRecord,
+  ElicitationContentValue,
+  ElicitationFormSchema,
   MessageActivity,
+  PendingElicitationRecord,
   PendingPermissionRecord,
   SessionMessageItem,
   SubagentActivityItem,
@@ -75,7 +80,214 @@ import {
   SANDBOX_HOME_MOUNT,
   SANDBOX_WORKSPACE_MOUNT,
 } from './env-isolation.js';
-import { AGY_AGENT_MODES, getAgyAgentMode } from './profile-settings.js';
+import {
+  addAgyAllowPermissionRule,
+  AGY_AGENT_MODES,
+  formatMcpPermissionRule,
+  getAgyAgentMode,
+  isValidAgyPermissionRule,
+} from './profile-settings.js';
+
+function normalizeTargetPathForRule(
+  rawPath: string,
+  workspaceDir: string,
+  sandboxWorkspaceRoot: string
+): string | null {
+  const trimmed = rawPath.trim();
+  if (!trimmed || /[\r\n\0)]/.test(trimmed)) return null;
+  const hostPath = toHostWorkspacePath(workspaceDir, sandboxWorkspaceRoot, trimmed);
+  const resolvedWorkspace = path.resolve(workspaceDir);
+  const resolvedHost = path.resolve(hostPath);
+  if (
+    resolvedHost === resolvedWorkspace ||
+    resolvedHost.startsWith(`${resolvedWorkspace}${path.sep}`)
+  ) {
+    const rel = path.relative(resolvedWorkspace, resolvedHost);
+    return rel ? rel.replace(/\\/g, '/') : '.';
+  }
+  return hostPath;
+}
+
+export function deriveAgyPermissionRule(params: {
+  toolCall: ToolCallItem;
+  workspaceDir: string;
+  sandboxWorkspaceRoot: string;
+  knownMcpServerNames?: string[];
+}): string | null {
+  const { toolCall, workspaceDir, sandboxWorkspaceRoot, knownMcpServerNames = [] } = params;
+  if (!toolCall || toolCall.toolCallId.startsWith('interaction_')) {
+    return null;
+  }
+
+  const name = (toolCall.name ?? '').trim();
+  const title = (toolCall.title ?? '').trim();
+  const kind = (toolCall.kind ?? '').trim().toLowerCase();
+  const rawObj =
+    toolCall.rawInput && typeof toolCall.rawInput === 'object' && !Array.isArray(toolCall.rawInput)
+      ? (toolCall.rawInput as Record<string, unknown>)
+      : null;
+
+  const firstStr = (...candidates: unknown[]): string | null => {
+    for (const c of candidates) {
+      if (typeof c === 'string' && c.trim()) return c.trim();
+    }
+    return null;
+  };
+
+  // 1) Explicit mcp(server/tool) in title/name
+  const explicitMcp = /\bmcp\(([^/\r\n\0)]+)\/([^)\r\n\0]+)\)/.exec(`${name} ${title}`);
+  if (explicitMcp) {
+    const rule = formatMcpPermissionRule(explicitMcp[1], explicitMcp[2]);
+    return isValidAgyPermissionRule(rule) ? rule : null;
+  }
+
+  // 2) MCP tool calls via call_mcp_tool or rawInput { ServerName, ToolName }
+  const mcpServerFromInput = firstStr(
+    rawObj?.ServerName,
+    rawObj?.serverName,
+    rawObj?.server,
+    rawObj?.mcpServer
+  );
+  const mcpToolFromInput = firstStr(
+    rawObj?.ToolName,
+    rawObj?.toolName,
+    rawObj?.tool,
+    rawObj?.mcpTool
+  );
+  if (mcpServerFromInput && mcpToolFromInput) {
+    const rule = formatMcpPermissionRule(mcpServerFromInput, mcpToolFromInput);
+    return isValidAgyPermissionRule(rule) ? rule : null;
+  }
+
+  // 3) Eager-loaded MCP tools: mcp__<server>__<tool> or mcp_<server>_<tool>
+  if (name.startsWith('mcp__')) {
+    const rest = name.slice('mcp__'.length);
+    const sepIdx = rest.indexOf('__');
+    if (sepIdx > 0 && sepIdx + 2 < rest.length) {
+      const rule = formatMcpPermissionRule(rest.slice(0, sepIdx), rest.slice(sepIdx + 2));
+      if (isValidAgyPermissionRule(rule)) return rule;
+    }
+  }
+  if (name.startsWith('mcp_')) {
+    const rest = name.slice('mcp_'.length);
+    const sortedKnown = [...knownMcpServerNames].sort((a, b) => b.length - a.length);
+    for (const srv of sortedKnown) {
+      if (rest.startsWith(`${srv}_`) && rest.length > srv.length + 1) {
+        const rule = formatMcpPermissionRule(srv, rest.slice(srv.length + 1));
+        if (isValidAgyPermissionRule(rule)) return rule;
+      }
+    }
+    const firstUnderscore = rest.indexOf('_');
+    if (firstUnderscore > 0 && firstUnderscore + 1 < rest.length) {
+      const rule = formatMcpPermissionRule(rest.slice(0, firstUnderscore), rest.slice(firstUnderscore + 1));
+      if (isValidAgyPermissionRule(rule)) return rule;
+    }
+  }
+
+  // 4) Terminal commands
+  if (
+    kind === 'execute' ||
+    name === 'run_command' ||
+    name === 'bash' ||
+    name === 'execute_command'
+  ) {
+    const rawCmd = firstStr(rawObj?.CommandLine, rawObj?.command, rawObj?.cmd);
+    if (rawCmd) {
+      const cleanLine = rawCmd.split(/[\r\n\0]/)[0]?.trim() ?? '';
+      if (cleanLine && !cleanLine.includes(')')) {
+        const rule = `command(${cleanLine})`;
+        if (isValidAgyPermissionRule(rule)) return rule;
+      }
+    }
+    return null;
+  }
+
+  // 5) File write / edit
+  if (
+    kind === 'edit' ||
+    kind === 'delete' ||
+    kind === 'move' ||
+    [
+      'write_to_file',
+      'replace_file_content',
+      'multi_replace_file_content',
+      'write_file',
+      'edit_file',
+      'writeTextFile',
+    ].includes(name)
+  ) {
+    const rawPath = firstStr(
+      toolCall.locations?.[0]?.path,
+      rawObj?.TargetFile,
+      rawObj?.targetFile,
+      rawObj?.file_path,
+      rawObj?.path
+    );
+    if (rawPath) {
+      const target = normalizeTargetPathForRule(rawPath, workspaceDir, sandboxWorkspaceRoot);
+      if (target) {
+        const rule = `write_file(${target})`;
+        if (isValidAgyPermissionRule(rule)) return rule;
+      }
+    }
+    return null;
+  }
+
+  // 6) File read / search
+  if (
+    kind === 'read' ||
+    kind === 'search' ||
+    [
+      'view_file',
+      'read_file',
+      'readTextFile',
+      'grep_search',
+      'find_by_name',
+      'list_dir',
+    ].includes(name)
+  ) {
+    const rawPath = firstStr(
+      toolCall.locations?.[0]?.path,
+      rawObj?.AbsolutePath,
+      rawObj?.SearchPath,
+      rawObj?.DirectoryPath,
+      rawObj?.file_path,
+      rawObj?.path
+    );
+    if (rawPath) {
+      const target = normalizeTargetPathForRule(rawPath, workspaceDir, sandboxWorkspaceRoot);
+      if (target) {
+        const rule = `read_file(${target})`;
+        if (isValidAgyPermissionRule(rule)) return rule;
+      }
+    }
+    return null;
+  }
+
+  // 7) URL fetch / browser
+  if (
+    kind === 'fetch' ||
+    ['read_url_content', 'read_url', 'fetch_url', 'browse', 'execute_url'].includes(name)
+  ) {
+    const firstUrl = Array.isArray(rawObj?.urls) ? rawObj.urls[0] : undefined;
+    const rawUrl = firstStr(rawObj?.Url, rawObj?.url, firstUrl);
+    if (rawUrl) {
+      try {
+        const host = new URL(rawUrl).hostname.trim();
+        if (host) {
+          const action = name.includes('execute') || name.includes('browse') ? 'execute_url' : 'read_url';
+          const rule = `${action}(${host})`;
+          if (isValidAgyPermissionRule(rule)) return rule;
+        }
+      } catch {
+        // ignore invalid URL
+      }
+    }
+    return null;
+  }
+
+  return null;
+}
 
 export function classifySubagentToolCall(params: {
   name?: string;
@@ -367,6 +579,7 @@ interface ActiveTurnBridge {
   sessionMessages: SessionMessageItem[];
   lastDbFlushAt: number;
   pendingResolvers: Map<string, (outcome: RequestPermissionResponse) => void>;
+  pendingElicitationResolvers: Map<string, (resp: CreateElicitationResponse) => void>;
   beforeWorkspaceSnap: WorkspaceSnapshot;
   emittedArtifactIds: Set<string>;
   lastActivityAt: number;
@@ -837,19 +1050,70 @@ export class AcpClientManager {
     chatId: string;
     permissionId: string;
     selectedOptionId: string | null;
+    alwaysAllow?: boolean;
     cancel?: boolean;
     clientId?: string | null;
   }): PendingPermissionRecord | null {
+    const existing = this.db.getPermission(params.userId, params.permissionId);
+    if (!existing || existing.chatId !== params.chatId || existing.status !== 'pending') {
+      return null;
+    }
+
+    const explicitlyRequestedOption =
+      !params.cancel && params.selectedOptionId
+        ? existing.options.find((o) => o.optionId === params.selectedOptionId) ?? null
+        : null;
+    const explicitNonAllow = Boolean(
+      explicitlyRequestedOption && !explicitlyRequestedOption.kind.startsWith('allow')
+    );
+
+    let effectiveOptionId = params.cancel ? null : params.selectedOptionId;
+    if (!params.cancel && params.alwaysAllow && !explicitNonAllow) {
+      const nativeAlwaysOpt = existing.options.find((o) => o.kind === 'allow_always');
+      const allowOnceOpt = existing.options.find((o) => o.kind.startsWith('allow'));
+      if (nativeAlwaysOpt) {
+        effectiveOptionId = nativeAlwaysOpt.optionId;
+      } else if (!effectiveOptionId && allowOnceOpt) {
+        effectiveOptionId = allowOnceOpt.optionId;
+      }
+    }
+
+    const chosenOption = effectiveOptionId
+      ? existing.options.find((o) => o.optionId === effectiveOptionId) ?? null
+      : null;
+    const isChosenAllow = Boolean(chosenOption && chosenOption.kind.startsWith('allow'));
+    const isAlwaysAllow =
+      !params.cancel &&
+      isChosenAllow &&
+      (chosenOption?.kind === 'allow_always' || Boolean(params.alwaysAllow));
+
     const status = params.cancel ? 'cancelled' : 'resolved';
     const updated = this.db.resolvePermissionAtomically({
       userId: params.userId,
       permissionId: params.permissionId,
-      selectedOptionId: params.cancel ? null : params.selectedOptionId,
+      selectedOptionId: effectiveOptionId,
       status,
       clientId: params.clientId,
     });
     if (!updated) {
       return null;
+    }
+
+    if (isAlwaysAllow && existing.alwaysAllowRule) {
+      const profile = this.db.getAgyProfile(params.userId);
+      if (profile) {
+        try {
+          this.db.withAgyProfileSettingsWrite(() => {
+            addAgyAllowPermissionRule(profile.profileDir, existing.alwaysAllowRule!);
+          });
+          const mcpMatch = /^mcp\(([^/]+)\/(.+)\)$/.exec(existing.alwaysAllowRule);
+          if (mcpMatch) {
+            this.mcpService?.recordToolAlwaysAllowFromChat(params.userId, mcpMatch[1], mcpMatch[2]);
+          }
+        } catch (err) {
+          console.warn('[acp] Failed to persist always-allow permission rule:', err);
+        }
+      }
     }
 
     const worker = this.workers.get(`${params.userId}:${params.chatId}`);
@@ -872,15 +1136,26 @@ export class AcpClientManager {
     const resolver = targetBridge?.pendingResolvers.get(params.permissionId);
     if (resolver && targetBridge) {
       targetBridge.pendingResolvers.delete(params.permissionId);
-      if (params.cancel || !params.selectedOptionId) {
+      if (params.cancel || !effectiveOptionId) {
         resolver({ outcome: { outcome: 'cancelled' } });
       } else {
-        resolver({ outcome: { outcome: 'selected', optionId: params.selectedOptionId } });
+        resolver({ outcome: { outcome: 'selected', optionId: effectiveOptionId } });
       }
     }
 
+    const hasPendingForRun =
+      (targetBridge
+        ? targetBridge.pendingResolvers.size > 0 || targetBridge.pendingElicitationResolvers.size > 0
+        : false) ||
+      this.db
+        .listPendingPermissionsForChat(params.userId, params.chatId)
+        .some((p) => p.runId === updated.runId) ||
+      this.db
+        .listPendingElicitationsForChat(params.userId, params.chatId)
+        .some((e) => e.runId === updated.runId);
+
     const run = this.db.getRun(params.userId, updated.runId);
-    if (run && run.status === 'awaiting_permission') {
+    if (run && run.status === 'awaiting_permission' && !hasPendingForRun) {
       this.db.updateRun(params.userId, run.id, { status: 'running' });
     }
 
@@ -889,7 +1164,93 @@ export class AcpClientManager {
       type: 'permission.resolved',
       chatId: params.chatId,
       runId: updated.runId,
-      payload: { permission: updated },
+      payload: { permission: updated, hasPendingForRun },
+    });
+    return updated;
+  }
+
+  resolvePendingElicitation(params: {
+    userId: string;
+    chatId: string;
+    elicitationId: string;
+    action: 'accept' | 'decline' | 'cancel';
+    content?: Record<string, ElicitationContentValue> | null;
+    clientId?: string | null;
+  }): PendingElicitationRecord | null {
+    const existing = this.db.getElicitation(params.userId, params.elicitationId);
+    if (!existing || existing.chatId !== params.chatId || existing.status !== 'pending') {
+      return null;
+    }
+
+    const status: PendingElicitationRecord['status'] =
+      params.action === 'cancel' ? 'cancelled' : 'resolved';
+    const responseContent =
+      params.action === 'accept' ? (params.content ?? null) : null;
+
+    const updated = this.db.resolveElicitationAtomically({
+      userId: params.userId,
+      elicitationId: params.elicitationId,
+      selectedAction: params.action,
+      responseContent,
+      status,
+      clientId: params.clientId,
+    });
+    if (!updated) {
+      return null;
+    }
+
+    const worker = this.workers.get(`${params.userId}:${params.chatId}`);
+    let targetBridge: ActiveTurnBridge | null = null;
+    if (worker) {
+      if (worker.activeTurn?.pendingElicitationResolvers.has(params.elicitationId)) {
+        targetBridge = worker.activeTurn;
+      } else {
+        for (const b of worker.turnBridges.values()) {
+          if (b.pendingElicitationResolvers.has(params.elicitationId)) {
+            targetBridge = b;
+            break;
+          }
+        }
+        if (!targetBridge && worker.backgroundBridge?.pendingElicitationResolvers.has(params.elicitationId)) {
+          targetBridge = worker.backgroundBridge;
+        }
+      }
+    }
+    const resolver = targetBridge?.pendingElicitationResolvers.get(params.elicitationId);
+    if (resolver && targetBridge) {
+      targetBridge.pendingElicitationResolvers.delete(params.elicitationId);
+      if (params.action === 'accept') {
+        resolver({
+          action: 'accept',
+          ...(responseContent !== null ? { content: responseContent } : {}),
+        });
+      } else {
+        resolver({ action: params.action });
+      }
+    }
+
+    const hasPendingForRun =
+      (targetBridge
+        ? targetBridge.pendingResolvers.size > 0 || targetBridge.pendingElicitationResolvers.size > 0
+        : false) ||
+      this.db
+        .listPendingPermissionsForChat(params.userId, params.chatId)
+        .some((p) => p.runId === updated.runId) ||
+      this.db
+        .listPendingElicitationsForChat(params.userId, params.chatId)
+        .some((e) => e.runId === updated.runId);
+
+    const run = this.db.getRun(params.userId, updated.runId);
+    if (run && run.status === 'awaiting_permission' && !hasPendingForRun) {
+      this.db.updateRun(params.userId, run.id, { status: 'running' });
+    }
+
+    this.hub.emitDurable({
+      userId: params.userId,
+      type: 'elicitation.resolved',
+      chatId: params.chatId,
+      runId: updated.runId,
+      payload: { elicitation: updated, hasPendingForRun },
     });
     return updated;
   }
@@ -899,7 +1260,7 @@ export class AcpClientManager {
     if (!worker || !worker.activeTurn || worker.activeTurn.runId !== runId) {
       return;
     }
-    // Reject any awaiting permissions for this run first so prompt returns immediately
+    // Reject any awaiting permissions and elicitations for this run first so prompt returns immediately
     for (const [permId, resolver] of worker.activeTurn.pendingResolvers.entries()) {
       this.db.resolvePermissionAtomically({
         userId,
@@ -910,6 +1271,26 @@ export class AcpClientManager {
       resolver({ outcome: { outcome: 'cancelled' } });
     }
     worker.activeTurn.pendingResolvers.clear();
+
+    for (const [elicitId, resolver] of worker.activeTurn.pendingElicitationResolvers.entries()) {
+      const updated = this.db.resolveElicitationAtomically({
+        userId,
+        elicitationId: elicitId,
+        selectedAction: 'cancel',
+        status: 'cancelled',
+      });
+      if (updated) {
+        this.hub.emitDurable({
+          userId,
+          type: 'elicitation.resolved',
+          chatId,
+          runId,
+          payload: { elicitation: updated },
+        });
+      }
+      resolver({ action: 'cancel' });
+    }
+    worker.activeTurn.pendingElicitationResolvers.clear();
 
     if (worker.acpSessionId) {
       await worker.conn.agent
@@ -965,6 +1346,7 @@ export class AcpClientManager {
       sessionMessages: [],
       lastDbFlushAt: nowInit,
       pendingResolvers: new Map(),
+      pendingElicitationResolvers: new Map(),
       beforeWorkspaceSnap: beforeSnap,
       emittedArtifactIds: new Set(),
       lastActivityAt: nowInit,
@@ -1278,7 +1660,11 @@ export class AcpClientManager {
         });
         const toolCall: ToolCallItem = {
           toolCallId: params.toolCall.toolCallId,
-          title: params.toolCall.title ?? 'ツール実行の許可',
+          title:
+            params.toolCall.title ??
+            (params.toolCall.toolCallId.startsWith('interaction_')
+              ? 'エージェントからの質問'
+              : 'ツール実行の許可'),
           ...((params.toolCall as { name?: string }).name
             ? { name: (params.toolCall as { name?: string }).name }
             : {}),
@@ -1295,6 +1681,22 @@ export class AcpClientManager {
           name: o.name,
           kind: o.kind,
         }));
+        const isQuestion = toolCall.toolCallId.startsWith('interaction_');
+        const isToolApproval =
+          !isQuestion &&
+          options.some((o) => o.kind.startsWith('allow')) &&
+          options.some((o) => o.kind.startsWith('reject'));
+        const knownMcpServerNames = isToolApproval
+          ? this.db.listEffectiveMcpServersForUser(turn.userId).map((s) => s.name)
+          : [];
+        const alwaysAllowRule = isToolApproval
+          ? deriveAgyPermissionRule({
+              toolCall,
+              workspaceDir: workerRef.workspaceDir,
+              sandboxWorkspaceRoot: workerRef.sandboxWorkspaceRoot,
+              knownMcpServerNames,
+            })
+          : null;
 
         const record = this.db.createPendingPermission({
           id: permId,
@@ -1303,6 +1705,7 @@ export class AcpClientManager {
           userId: turn.userId,
           toolCall,
           options,
+          alwaysAllowRule,
         });
 
         const existingRun = turn.runId ? this.db.getRun(turn.userId, turn.runId) : null;
@@ -1326,6 +1729,7 @@ export class AcpClientManager {
             runId: turn.runId,
             permissionId: record.id,
             toolTitle: toolCall.title,
+            isQuestion,
           })
           .catch((err) => {
             console.warn('[acp] Push permission notification failed:', err);
@@ -1346,6 +1750,120 @@ export class AcpClientManager {
           };
           signal.addEventListener('abort', onCancelSignal, { once: true });
         });
+      })
+      .onRequest(
+        methods.client.elicitation.create,
+        async ({ params, signal }): Promise<CreateElicitationResponse> => {
+          const req = params as CreateElicitationRequest;
+          const sessionId =
+            'sessionId' in req && typeof req.sessionId === 'string' ? req.sessionId : undefined;
+          const toolCallId =
+            'toolCallId' in req && typeof req.toolCallId === 'string' ? req.toolCallId : undefined;
+          const turn = workerRef
+            ? this.resolveBridgeForPermission(workerRef, toolCallId, sessionId)
+            : null;
+          if (!workerRef || !turn) {
+            return { action: 'cancel' };
+          }
+          workerRef.lastUsedAt = Date.now();
+          workerRef.lastBackgroundActivityAt = Date.now();
+
+          const elicitId = crypto.randomUUID();
+          const mode: 'form' | 'url' = req.mode === 'url' ? 'url' : 'form';
+          const requestedSchema: ElicitationFormSchema | null =
+            mode === 'form' && 'requestedSchema' in req && req.requestedSchema
+              ? (req.requestedSchema as unknown as ElicitationFormSchema)
+              : null;
+          const externalElicitationId =
+            mode === 'url' && 'elicitationId' in req && typeof req.elicitationId === 'string'
+              ? req.elicitationId
+              : null;
+          const url =
+            mode === 'url' && 'url' in req && typeof req.url === 'string' ? req.url : null;
+
+          const record = this.db.createPendingElicitation({
+            id: elicitId,
+            runId: turn.runId,
+            chatId: turn.chatId,
+            userId: turn.userId,
+            toolCallId: toolCallId ?? null,
+            externalElicitationId,
+            mode,
+            message: req.message,
+            requestedSchema,
+            url,
+          });
+
+          const existingRun = turn.runId ? this.db.getRun(turn.userId, turn.runId) : null;
+          if (
+            existingRun &&
+            (existingRun.status === 'running' || existingRun.status === 'queued')
+          ) {
+            this.db.updateRun(turn.userId, turn.runId, { status: 'awaiting_permission' });
+          }
+
+          this.hub.emitDurable({
+            userId: turn.userId,
+            type: 'elicitation.requested',
+            chatId: turn.chatId,
+            runId: turn.runId,
+            payload: { elicitation: record },
+          });
+
+          void this.pushService
+            ?.notifyElicitationRequested({
+              userId: turn.userId,
+              chatId: turn.chatId,
+              runId: turn.runId,
+              elicitationId: record.id,
+              message: record.message,
+            })
+            .catch((err) => {
+              console.warn('[acp] Push elicitation notification failed:', err);
+            });
+
+          return new Promise<CreateElicitationResponse>((resolve) => {
+            turn.pendingElicitationResolvers.set(elicitId, resolve);
+            const onCancelSignal = () => {
+              if (turn.pendingElicitationResolvers.delete(elicitId)) {
+                const updated = this.db.resolveElicitationAtomically({
+                  userId: turn.userId,
+                  elicitationId: elicitId,
+                  selectedAction: 'cancel',
+                  status: 'cancelled',
+                });
+                if (updated) {
+                  this.hub.emitDurable({
+                    userId: turn.userId,
+                    type: 'elicitation.resolved',
+                    chatId: turn.chatId,
+                    runId: turn.runId,
+                    payload: { elicitation: updated },
+                  });
+                }
+                resolve({ action: 'cancel' });
+              }
+            };
+            signal.addEventListener('abort', onCancelSignal, { once: true });
+          });
+        }
+      )
+      .onNotification(methods.client.elicitation.complete, async ({ params }) => {
+        if (!workerRef || !params?.elicitationId) return;
+        const pending = this.db.getPendingElicitationByExternalId(
+          workerRef.userId,
+          workerRef.chatId,
+          params.elicitationId
+        );
+        if (pending) {
+          this.resolvePendingElicitation({
+            userId: workerRef.userId,
+            chatId: workerRef.chatId,
+            elicitationId: pending.id,
+            action: 'accept',
+            content: null,
+          });
+        }
       })
       .onNotification(
         methods.client.session.update as unknown as `_${string}`,
@@ -1385,6 +1903,7 @@ export class AcpClientManager {
           fs: { readTextFile: true, writeTextFile: supportsWorkspaceTextWrites },
           terminal: false,
           session: { configOptions: { boolean: {} } },
+          elicitation: { form: {}, url: {} },
           subagents: {},
           plan: {},
           auth: { terminal: true },
@@ -1772,7 +2291,7 @@ export class AcpClientManager {
   }
 
   private isBridgeBusy(b: ActiveTurnBridge): boolean {
-    if (b.pendingResolvers.size > 0) return true;
+    if (b.pendingResolvers.size > 0 || b.pendingElicitationResolvers.size > 0) return true;
     if (
       b.parentState === 'running' ||
       b.parentState === 'requires_action' ||
@@ -2220,6 +2739,7 @@ export class AcpClientManager {
       sessionMessages: [...(latestAssistant.sessionMessages ?? [])],
       lastDbFlushAt: 0,
       pendingResolvers: new Map(),
+      pendingElicitationResolvers: new Map(),
       beforeWorkspaceSnap,
       emittedArtifactIds: new Set(latestAssistant.artifactIds),
       lastActivityAt: Date.now(),

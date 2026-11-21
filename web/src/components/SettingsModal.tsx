@@ -608,9 +608,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <>
               {onOpenMcp && (
                 <section className="settings-section">
-                  <h4>MCP サーバー管理（管理者機能）</h4>
+                  <h4>MCP サーバー</h4>
                   <p className="muted-xs" style={{ marginBottom: 10 }}>
-                    全プロファイル共有または管理者プロファイル専用のMCPサーバー（リモート OAuth / APIキー / Bearer / カスタムヘッダー、ローカル stdio）を追加・管理します。
+                    チャットで利用する外部ツールやサーバーを接続・管理します。
                   </p>
                   <button
                     type="button"
@@ -620,7 +620,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       onOpenMcp();
                     }}
                   >
-                    MCP サーバー管理を開く
+                    MCP 設定を開く
                   </button>
                 </section>
               )}

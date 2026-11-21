@@ -6,8 +6,12 @@ import type {
   AttachmentRef,
   AvailableCommandItem,
   ChatRecord,
+  ElicitationContentValue,
+  ElicitationEnumOption,
+  ElicitationPropertySchema,
   MessageRecord,
   ParsedSessionOptions,
+  PendingElicitationRecord,
   PendingPermissionRecord,
   ProjectRecord,
   RunRecord,
@@ -48,6 +52,7 @@ interface ChatViewProps {
   messages: ChatViewMessage[];
   artifacts: ArtifactRecord[];
   pendingPermissions: PendingPermissionRecord[];
+  pendingElicitations: PendingElicitationRecord[];
   activeRun: RunRecord | null;
   sessionOptions: ParsedSessionOptions | null;
   availableCommands?: AvailableCommandItem[];
@@ -71,6 +76,7 @@ interface ChatViewProps {
   onSyncProject: () => Promise<void>;
   onOpenArtifact: (artifact: ArtifactRecord) => void;
   onPermissionUpdated: (perm: PendingPermissionRecord) => void;
+  onElicitationUpdated: (elicit: PendingElicitationRecord) => void;
   onOpenSkills?: () => void;
   externalDraftCommand?: { slug: string; token: number } | null;
 }
@@ -451,12 +457,24 @@ const PermissionCard: React.FC<{
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const handleAction = async (optionId?: string, cancel?: boolean) => {
+  const isQuestion = perm.toolCall.toolCallId.startsWith('interaction_');
+  const allowOption = perm.options.find((o) => o.kind.startsWith('allow') && o.kind !== 'allow_always');
+  const hasNativeAlwaysOption = perm.options.some((o) => o.kind === 'allow_always');
+  const hasRejectOption = perm.options.some((o) => o.kind.startsWith('reject'));
+  const showAlwaysAllowButton =
+    !isQuestion &&
+    !hasNativeAlwaysOption &&
+    Boolean(allowOption) &&
+    hasRejectOption &&
+    Boolean(perm.alwaysAllowRule);
+
+  const handleAction = async (optionId?: string, cancel?: boolean, alwaysAllow?: boolean) => {
     setBusy(true);
     setNotice(null);
     try {
       const res = await api.resolvePermission(perm.chatId, perm.id, {
         optionId: optionId ?? null,
+        alwaysAllow: Boolean(alwaysAllow),
         cancel: Boolean(cancel),
         clientId,
       });
@@ -475,6 +493,61 @@ const PermissionCard: React.FC<{
       setBusy(false);
     }
   };
+
+  if (isQuestion) {
+    const choiceOptions = perm.options.filter((o) => !o.kind.startsWith('reject'));
+    const rejectOptions = perm.options.filter((o) => o.kind.startsWith('reject'));
+    return (
+      <div className="question-card" role="region" aria-label="エージェントからの質問">
+        <div className="question-head">
+          <span className="question-badge" aria-hidden="true">?</span>
+          <div className="question-head-text">
+            <div className="question-title">エージェントからの質問</div>
+          </div>
+        </div>
+        {perm.toolCall.title && (
+          <div className="question-prompt-text">{perm.toolCall.title}</div>
+        )}
+        {choiceOptions.length > 0 && (
+          <div className="question-options-list">
+            {choiceOptions.map((opt) => (
+              <button
+                key={opt.optionId}
+                type="button"
+                disabled={busy}
+                className="btn btn-question-option"
+                onClick={() => void handleAction(opt.optionId, false, false)}
+              >
+                {opt.name}
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="question-actions">
+          {rejectOptions.map((opt) => (
+            <button
+              key={opt.optionId}
+              type="button"
+              disabled={busy}
+              className="btn btn-secondary btn-sm"
+              onClick={() => void handleAction(opt.optionId, false, false)}
+            >
+              {opt.name}
+            </button>
+          ))}
+          <button
+            type="button"
+            disabled={busy}
+            className="btn btn-ghost btn-sm"
+            onClick={() => void handleAction(undefined, true, false)}
+          >
+            キャンセル
+          </button>
+        </div>
+        {notice && <div className="question-notice" role="alert">{notice}</div>}
+      </div>
+    );
+  }
 
   return (
     <div className="permission-card" role="region" aria-label="ツール実行の承認待ち">
@@ -501,6 +574,13 @@ const PermissionCard: React.FC<{
         <pre className="tool-json">{JSON.stringify(perm.toolCall.rawInput, null, 2)}</pre>
       )}
 
+      {showAlwaysAllowButton && perm.alwaysAllowRule && (
+        <div className="permission-rule-preview muted-xs">
+          <span>常に許可の登録対象:</span>
+          <code className="inline-code">{perm.alwaysAllowRule}</code>
+        </div>
+      )}
+
       <div className="permission-actions">
         {perm.options.map((opt) => {
           const isReject = opt.kind.startsWith('reject');
@@ -510,23 +590,636 @@ const PermissionCard: React.FC<{
               type="button"
               disabled={busy}
               className={`btn btn-sm ${isReject ? 'btn-danger-outline' : 'btn-primary'}`}
-              onClick={() => void handleAction(opt.optionId, false)}
+              onClick={() => void handleAction(opt.optionId, false, opt.kind === 'allow_always')}
             >
               {opt.name}
             </button>
           );
         })}
+        {showAlwaysAllowButton && allowOption && (
+          <button
+            type="button"
+            disabled={busy}
+            className="btn btn-secondary btn-sm"
+            title={perm.alwaysAllowRule ? `次回から確認せず許可 (${perm.alwaysAllowRule})` : undefined}
+            onClick={() => void handleAction(allowOption.optionId, false, true)}
+          >
+            常に許可
+          </button>
+        )}
         <button
           type="button"
           disabled={busy}
           className="btn btn-ghost btn-sm"
-          onClick={() => void handleAction(undefined, true)}
+          onClick={() => void handleAction(undefined, true, false)}
         >
           キャンセル
         </button>
       </div>
       {notice && <div className="muted-xs" style={{ marginTop: 6 }}>{notice}</div>}
     </div>
+  );
+});
+
+function normalizeElicitationChoices(
+  prop: ElicitationPropertySchema
+): Array<{ value: string; label: string; description?: string | null }> {
+  if (prop.type === 'string') {
+    const strProp = prop as Extract<ElicitationPropertySchema, { type: 'string' }>;
+    if (Array.isArray(strProp.oneOf) && strProp.oneOf.length > 0) {
+      return strProp.oneOf.map((o: ElicitationEnumOption) => ({
+        value: o.const,
+        label: o.title || o.const,
+        description: o.description ?? null,
+      }));
+    }
+    if (Array.isArray(strProp.enum) && strProp.enum.length > 0) {
+      return strProp.enum.map((v) => ({ value: v, label: v }));
+    }
+  }
+  if (prop.type === 'array') {
+    const arrProp = prop as Extract<ElicitationPropertySchema, { type: 'array' }>;
+    const items = arrProp.items as { anyOf?: ElicitationEnumOption[]; enum?: string[] } | undefined;
+    if (items && Array.isArray(items.anyOf) && items.anyOf.length > 0) {
+      return items.anyOf.map((o) => ({
+        value: o.const,
+        label: o.title || o.const,
+        description: o.description ?? null,
+      }));
+    }
+    if (items && Array.isArray(items.enum) && items.enum.length > 0) {
+      return items.enum.map((v) => ({ value: v, label: v }));
+    }
+  }
+  return [];
+}
+
+function isSafeHttpUrl(raw: string | null | undefined): raw is string {
+  if (!raw) return false;
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+const MAX_ELICITATION_PATTERN_LEN = 256;
+const MAX_ELICITATION_PATTERN_INPUT_LEN = 512;
+
+function isSafeElicitationPattern(pattern: string): boolean {
+  if (pattern.length === 0 || pattern.length > MAX_ELICITATION_PATTERN_LEN) return false;
+  if (/\\[1-9]/.test(pattern) || /\(\?[=!<]/.test(pattern)) return false;
+  let maxDepth = 0;
+  const stack: boolean[] = [];
+  for (let i = 0; i < pattern.length; i += 1) {
+    const ch = pattern[i];
+    if (ch === '\\') {
+      i += 1;
+      continue;
+    }
+    if (ch === '[') {
+      i += 1;
+      while (i < pattern.length) {
+        if (pattern[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (pattern[i] === ']') break;
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === '(') {
+      stack.push(false);
+      maxDepth = Math.max(maxDepth, stack.length);
+      if (maxDepth > 8) return false;
+      continue;
+    }
+    if (ch === ')') {
+      const hadInnerQuantOrAlt = stack.pop() ?? false;
+      const next = pattern[i + 1];
+      const hasOuterQuant = next === '+' || next === '*' || next === '?' || next === '{';
+      if (hadInnerQuantOrAlt && hasOuterQuant) {
+        return false;
+      }
+      if ((hadInnerQuantOrAlt || hasOuterQuant) && stack.length > 0) {
+        stack[stack.length - 1] = true;
+      }
+      continue;
+    }
+    if ((ch === '+' || ch === '*' || ch === '|' || ch === '{') && stack.length > 0) {
+      stack[stack.length - 1] = true;
+    }
+  }
+  return true;
+}
+
+const ElicitationCard: React.FC<{
+  elicit: PendingElicitationRecord;
+  clientId: string;
+  onResolved: (elicit: PendingElicitationRecord) => void;
+}> = React.memo(({ elicit, clientId, onResolved }) => {
+  const schema = elicit.requestedSchema;
+  const fieldEntries = useMemo(
+    () => Object.entries(schema?.properties ?? {}),
+    [schema]
+  );
+  const requiredSet = useMemo(
+    () => new Set(schema?.required ?? []),
+    [schema]
+  );
+
+  const [formValues, setFormValues] = useState<Record<string, string | boolean | string[]>>(() => {
+    const init: Record<string, string | boolean | string[]> = {};
+    for (const [key, prop] of Object.entries(elicit.requestedSchema?.properties ?? {})) {
+      if (prop.type === 'boolean') {
+        if (typeof prop.default === 'boolean') init[key] = prop.default;
+      } else if (prop.type === 'array') {
+        const hasEnumChoices = normalizeElicitationChoices(prop).length > 0;
+        if (hasEnumChoices) {
+          init[key] = Array.isArray(prop.default) ? prop.default.map(String) : [];
+        } else {
+          init[key] = Array.isArray(prop.default) ? prop.default.map(String).join('\n') : '';
+        }
+      } else if (prop.type === 'number' || prop.type === 'integer') {
+        if (typeof prop.default === 'number' && Number.isFinite(prop.default)) {
+          init[key] = String(prop.default);
+        }
+      } else if (prop.type === 'string') {
+        if (typeof prop.default === 'string') {
+          init[key] = prop.default;
+        }
+      }
+    }
+    return init;
+  });
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const submitAction = async (
+    action: 'accept' | 'decline' | 'cancel',
+    content?: Record<string, ElicitationContentValue> | null
+  ) => {
+    setBusy(true);
+    setNotice(null);
+    try {
+      const res = await api.resolveElicitation(elicit.chatId, elicit.id, {
+        action,
+        ...(content !== undefined ? { content } : {}),
+        clientId,
+      });
+      onResolved(res.elicitation);
+    } catch (err) {
+      if (err instanceof ApiError && err.code === 'ALREADY_RESOLVED') {
+        const already = (err.data as { elicitation?: PendingElicitationRecord } | undefined)?.elicitation;
+        if (already) {
+          onResolved(already);
+        } else {
+          onResolved({ ...elicit, status: 'resolved' });
+        }
+        setNotice('別の端末または直前の操作で既に処理されました。');
+      } else {
+        setNotice(err instanceof ApiError ? err.message : '送信に失敗しました。');
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleFormSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const content: Record<string, ElicitationContentValue> = {};
+
+    for (const [key, prop] of fieldEntries) {
+      const label = (typeof prop.title === 'string' && prop.title) || key;
+      const isReq = requiredSet.has(key);
+      const rawVal = formValues[key];
+
+      if (prop.type === 'boolean') {
+        const hasExplicit = typeof rawVal === 'boolean';
+        if (isReq && !hasExplicit) {
+          setNotice(`「${label}」を選択してください。`);
+          return;
+        }
+        if (hasExplicit) {
+          content[key] = rawVal;
+        }
+        continue;
+      }
+
+      if (prop.type === 'array') {
+        const arr = Array.isArray(rawVal)
+          ? rawVal
+          : typeof rawVal === 'string'
+            ? rawVal
+                .split(/\r?\n/)
+                .map((s) => s.trim())
+                .filter(Boolean)
+            : [];
+        const arrProp = prop as Extract<ElicitationPropertySchema, { type: 'array' }>;
+        if (isReq && arr.length === 0) {
+          setNotice(`「${label}」を1つ以上入力または選択してください。`);
+          return;
+        }
+        if (arrProp.minItems != null && arr.length > 0 && arr.length < arrProp.minItems) {
+          setNotice(`「${label}」は${arrProp.minItems}件以上にしてください。`);
+          return;
+        }
+        if (arrProp.maxItems != null && arr.length > arrProp.maxItems) {
+          setNotice(`「${label}」は${arrProp.maxItems}件以内にしてください。`);
+          return;
+        }
+        if (arr.length > 0 || isReq) {
+          content[key] = arr;
+        }
+        continue;
+      }
+
+      if (prop.type === 'number' || prop.type === 'integer') {
+        const str = typeof rawVal === 'string' ? rawVal.trim() : '';
+        if (!str) {
+          if (isReq) {
+            setNotice(`「${label}」を入力してください。`);
+            return;
+          }
+          continue;
+        }
+        const num = Number(str);
+        if (!Number.isFinite(num)) {
+          setNotice(`「${label}」には数値を入力してください。`);
+          return;
+        }
+        if (prop.type === 'integer' && !Number.isInteger(num)) {
+          setNotice(`「${label}」には整数を入力してください。`);
+          return;
+        }
+        const numProp = prop as Extract<ElicitationPropertySchema, { type: 'number' | 'integer' }>;
+        if (numProp.minimum != null && num < numProp.minimum) {
+          setNotice(`「${label}」は ${numProp.minimum} 以上にしてください。`);
+          return;
+        }
+        if (numProp.maximum != null && num > numProp.maximum) {
+          setNotice(`「${label}」は ${numProp.maximum} 以下にしてください。`);
+          return;
+        }
+        content[key] = num;
+        continue;
+      }
+
+      const text = typeof rawVal === 'string' ? rawVal : '';
+      const trimmed = text.trim();
+      if (!trimmed) {
+        if (isReq) {
+          setNotice(`「${label}」を入力または選択してください。`);
+          return;
+        }
+        continue;
+      }
+      const strProp = prop as Extract<ElicitationPropertySchema, { type: 'string' }>;
+      if (strProp.minLength != null && text.length < strProp.minLength) {
+        setNotice(`「${label}」は${strProp.minLength}文字以上で入力してください。`);
+        return;
+      }
+      if (strProp.maxLength != null && text.length > strProp.maxLength) {
+        setNotice(`「${label}」は${strProp.maxLength}文字以内で入力してください。`);
+        return;
+      }
+      if (
+        typeof strProp.pattern === 'string' &&
+        text.length <= MAX_ELICITATION_PATTERN_INPUT_LEN &&
+        isSafeElicitationPattern(strProp.pattern)
+      ) {
+        try {
+          const patternRegex = new RegExp(strProp.pattern);
+          if (!patternRegex.test(text)) {
+            setNotice(`「${label}」の入力形式が一致しません。`);
+            return;
+          }
+        } catch {
+          // Ignore malformed schema regex rather than blocking submission
+        }
+      }
+      content[key] = text;
+    }
+
+    void submitAction('accept', content);
+  };
+
+  if (elicit.mode === 'url') {
+    const safeUrl = isSafeHttpUrl(elicit.url) ? elicit.url : null;
+    return (
+      <div className="question-card" role="region" aria-label="エージェントからの外部連携リクエスト">
+        <div className="question-head">
+          <span className="question-badge" aria-hidden="true">?</span>
+          <div className="question-head-text">
+            <div className="question-title">エージェントからの確認リクエスト</div>
+          </div>
+        </div>
+        {elicit.message && <div className="question-prompt-text">{elicit.message}</div>}
+        {safeUrl ? (
+          <div className="question-url-box">
+            <a
+              href={safeUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn btn-primary btn-sm"
+            >
+              ページを開く
+            </a>
+            <code className="question-url-code">{safeUrl}</code>
+          </div>
+        ) : elicit.url ? (
+          <div className="question-notice">安全でない URL 形式のためリンクを開けません。</div>
+        ) : null}
+        <div className="question-actions">
+          <button
+            type="button"
+            disabled={busy}
+            className="btn btn-secondary btn-sm"
+            onClick={() => void submitAction('accept', null)}
+          >
+            完了
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            className="btn btn-ghost btn-sm"
+            onClick={() => void submitAction('decline')}
+          >
+            スキップ
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            className="btn btn-ghost btn-sm"
+            onClick={() => void submitAction('cancel')}
+          >
+            キャンセル
+          </button>
+        </div>
+        {notice && <div className="question-notice" role="alert">{notice}</div>}
+      </div>
+    );
+  }
+
+  return (
+    <form className="question-card" onSubmit={handleFormSubmit} role="region" aria-label="エージェントからの質問">
+      <div className="question-head">
+        <span className="question-badge" aria-hidden="true">?</span>
+        <div className="question-head-text">
+          <div className="question-title">{schema?.title || 'エージェントからの質問'}</div>
+          {schema?.description && <div className="muted-xs">{schema.description}</div>}
+        </div>
+      </div>
+      {elicit.message && <div className="question-prompt-text">{elicit.message}</div>}
+
+      {fieldEntries.length > 0 && (
+        <div className="question-fields">
+          {fieldEntries.map(([key, prop]) => {
+            const label = (typeof prop.title === 'string' && prop.title) || key;
+            const desc = typeof prop.description === 'string' ? prop.description : null;
+            const isReq = requiredSet.has(key);
+            const choices = normalizeElicitationChoices(prop);
+
+            if (prop.type === 'string' && choices.length > 0) {
+              const selected = typeof formValues[key] === 'string' ? (formValues[key] as string) : '';
+              return (
+                <fieldset key={key} className="question-field">
+                  <legend className="question-field-label">
+                    <span>{label}</span>
+                    {isReq && <span className="question-required-mark">必須</span>}
+                  </legend>
+                  {desc && <div className="question-field-desc">{desc}</div>}
+                  <div className="question-choices-stack">
+                    {choices.map((opt) => {
+                      const checked = selected === opt.value;
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          disabled={busy}
+                          aria-pressed={checked}
+                          className={`question-choice-card${checked ? ' is-selected' : ''}`}
+                          onClick={() => {
+                            setFormValues((prev) => {
+                              const next = { ...prev };
+                              if (checked && !isReq) {
+                                delete next[key];
+                              } else {
+                                next[key] = opt.value;
+                              }
+                              return next;
+                            });
+                          }}
+                        >
+                          <span className={`question-choice-indicator is-radio${checked ? ' is-checked' : ''}`} aria-hidden="true" />
+                          <span className="question-choice-body">
+                            <span className="question-choice-title">{opt.label}</span>
+                            {opt.description && (
+                              <span className="question-choice-desc">{opt.description}</span>
+                            )}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </fieldset>
+              );
+            }
+
+            if (prop.type === 'array') {
+              if (choices.length === 0) {
+                const textVal = typeof formValues[key] === 'string' ? (formValues[key] as string) : '';
+                return (
+                  <div key={key} className="question-field">
+                    <label className="question-field-label" htmlFor={`elicit-${elicit.id}-${key}`}>
+                      <span>{label}</span>
+                      {isReq && <span className="question-required-mark">必須</span>}
+                    </label>
+                    {desc && <div className="question-field-desc">{desc}</div>}
+                    <textarea
+                      id={`elicit-${elicit.id}-${key}`}
+                      rows={3}
+                      disabled={busy}
+                      className="question-textarea"
+                      placeholder="1行に1項目ずつ入力してください"
+                      value={textVal}
+                      onChange={(e) => setFormValues((prev) => ({ ...prev, [key]: e.target.value }))}
+                    />
+                  </div>
+                );
+              }
+
+              const selectedArr = Array.isArray(formValues[key]) ? (formValues[key] as string[]) : [];
+              return (
+                <fieldset key={key} className="question-field">
+                  <legend className="question-field-label">
+                    <span>{label}</span>
+                    {isReq && <span className="question-required-mark">必須</span>}
+                  </legend>
+                  {desc && <div className="question-field-desc">{desc}</div>}
+                  <div className="question-choices-stack">
+                    {choices.map((opt) => {
+                      const checked = selectedArr.includes(opt.value);
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          disabled={busy}
+                          aria-pressed={checked}
+                          className={`question-choice-card${checked ? ' is-selected' : ''}`}
+                          onClick={() => {
+                            setFormValues((prev) => {
+                              const cur = Array.isArray(prev[key]) ? (prev[key] as string[]) : [];
+                              const nextArr = checked
+                                ? cur.filter((v) => v !== opt.value)
+                                : [...cur, opt.value];
+                              return { ...prev, [key]: nextArr };
+                            });
+                          }}
+                        >
+                          <span className={`question-choice-indicator is-check${checked ? ' is-checked' : ''}`} aria-hidden="true">
+                            {checked ? <CheckIcon size={12} /> : null}
+                          </span>
+                          <span className="question-choice-body">
+                            <span className="question-choice-title">{opt.label}</span>
+                            {opt.description && (
+                              <span className="question-choice-desc">{opt.description}</span>
+                            )}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </fieldset>
+              );
+            }
+
+            if (prop.type === 'boolean') {
+              const checked = Boolean(formValues[key]);
+              return (
+                <div key={key} className="question-field">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    role="switch"
+                    aria-checked={checked}
+                    className={`question-choice-card question-bool-card${checked ? ' is-selected' : ''}`}
+                    onClick={() => setFormValues((prev) => ({ ...prev, [key]: !checked }))}
+                  >
+                    <span className={`question-choice-indicator is-check${checked ? ' is-checked' : ''}`} aria-hidden="true">
+                      {checked ? <CheckIcon size={12} /> : null}
+                    </span>
+                    <span className="question-choice-body">
+                      <span className="question-choice-title">
+                        {label}
+                        {isReq && <span className="question-required-mark" style={{ marginLeft: 6 }}>必須</span>}
+                      </span>
+                      {desc && <span className="question-choice-desc">{desc}</span>}
+                    </span>
+                  </button>
+                </div>
+              );
+            }
+
+            if (prop.type === 'number' || prop.type === 'integer') {
+              const numProp = prop as Extract<ElicitationPropertySchema, { type: 'number' | 'integer' }>;
+              const val = typeof formValues[key] === 'string' ? (formValues[key] as string) : '';
+              return (
+                <div key={key} className="question-field">
+                  <label className="question-field-label" htmlFor={`elicit-${elicit.id}-${key}`}>
+                    <span>{label}</span>
+                    {isReq && <span className="question-required-mark">必須</span>}
+                  </label>
+                  {desc && <div className="question-field-desc">{desc}</div>}
+                  <input
+                    id={`elicit-${elicit.id}-${key}`}
+                    type="number"
+                    disabled={busy}
+                    className="question-input"
+                    step={prop.type === 'integer' ? 1 : 'any'}
+                    min={numProp.minimum ?? undefined}
+                    max={numProp.maximum ?? undefined}
+                    value={val}
+                    onChange={(e) => setFormValues((prev) => ({ ...prev, [key]: e.target.value }))}
+                  />
+                </div>
+              );
+            }
+
+            const strProp = prop as Extract<ElicitationPropertySchema, { type: 'string' }>;
+            const val = typeof formValues[key] === 'string' ? (formValues[key] as string) : '';
+            const useTextarea =
+              !strProp.format &&
+              ((strProp.maxLength != null && strProp.maxLength > 120) ||
+                /detail|note|reason|custom|other|comment|memo|body|desc|free|text|説明|自由|補足|詳細|回答/i.test(key));
+            const inputType =
+              strProp.format === 'email'
+                ? 'email'
+                : strProp.format === 'uri'
+                  ? 'url'
+                  : strProp.format === 'date'
+                    ? 'date'
+                    : 'text';
+
+            return (
+              <div key={key} className="question-field">
+                <label className="question-field-label" htmlFor={`elicit-${elicit.id}-${key}`}>
+                  <span>{label}</span>
+                  {isReq && <span className="question-required-mark">必須</span>}
+                </label>
+                {desc && <div className="question-field-desc">{desc}</div>}
+                {useTextarea ? (
+                  <textarea
+                    id={`elicit-${elicit.id}-${key}`}
+                    rows={3}
+                    disabled={busy}
+                    className="question-textarea"
+                    placeholder={isReq ? '回答を入力...' : '自由記述（任意）'}
+                    value={val}
+                    onChange={(e) => setFormValues((prev) => ({ ...prev, [key]: e.target.value }))}
+                  />
+                ) : (
+                  <input
+                    id={`elicit-${elicit.id}-${key}`}
+                    type={inputType}
+                    disabled={busy}
+                    className="question-input"
+                    placeholder={isReq ? '回答を入力...' : '入力（任意）'}
+                    value={val}
+                    onChange={(e) => setFormValues((prev) => ({ ...prev, [key]: e.target.value }))}
+                  />
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="question-actions">
+        <button type="submit" disabled={busy} className="btn btn-primary btn-sm">
+          回答を送信
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          className="btn btn-secondary btn-sm"
+          onClick={() => void submitAction('decline')}
+        >
+          スキップ
+        </button>
+        <button
+          type="button"
+          disabled={busy}
+          className="btn btn-ghost btn-sm"
+          onClick={() => void submitAction('cancel')}
+        >
+          キャンセル
+        </button>
+      </div>
+      {notice && <div className="question-notice" role="alert">{notice}</div>}
+    </form>
   );
 });
 
@@ -538,12 +1231,14 @@ const MessageRow: React.FC<{
   clientId: string;
   queuePosition: number | null;
   msgPerms: PendingPermissionRecord[];
+  msgElicitations: PendingElicitationRecord[];
   msgArtifacts: ArtifactRecord[];
   isCopyTarget: boolean;
   hapticEnabled: boolean;
   onOpenArtifact: (artifact: ArtifactRecord) => void;
   onOpenAttachment: (att: AttachmentRef) => void;
   onPermissionUpdated: (perm: PendingPermissionRecord) => void;
+  onElicitationUpdated: (elicit: PendingElicitationRecord) => void;
   onResolveError: (msg: string) => void;
   onOpenLongPressMenu: (menu: LongPressMenuState) => void;
 }> = React.memo(
@@ -553,12 +1248,14 @@ const MessageRow: React.FC<{
     clientId,
     queuePosition,
     msgPerms,
+    msgElicitations,
     msgArtifacts,
     isCopyTarget,
     hapticEnabled,
     onOpenArtifact,
     onOpenAttachment,
     onPermissionUpdated,
+    onElicitationUpdated,
     onResolveError,
     onOpenLongPressMenu,
   }) => {
@@ -769,6 +1466,15 @@ const MessageRow: React.FC<{
               perm={perm}
               clientId={clientId}
               onResolved={onPermissionUpdated}
+            />
+          ))}
+
+          {msgElicitations.map((elicit) => (
+            <ElicitationCard
+              key={elicit.id}
+              elicit={elicit}
+              clientId={clientId}
+              onResolved={onElicitationUpdated}
             />
           ))}
 
@@ -1507,12 +2213,15 @@ const ChatComposer = React.memo(
   )
 );
 
+const EMPTY_ELICITATIONS: PendingElicitationRecord[] = [];
+
 export const ChatView: React.FC<ChatViewProps> = React.memo(({
   chat,
   project,
   messages,
   artifacts,
   pendingPermissions,
+  pendingElicitations,
   activeRun,
   sessionOptions,
   availableCommands = [],
@@ -1536,6 +2245,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
   onSyncProject,
   onOpenArtifact,
   onPermissionUpdated,
+  onElicitationUpdated,
   onOpenSkills,
   externalDraftCommand,
 }) => {
@@ -1614,6 +2324,46 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
     return grouped;
   }, [pendingPermissions]);
 
+  const prevElicitationsCacheRef = useRef<Map<string, PendingElicitationRecord[]>>(new Map());
+  const pendingElicitationsByRunId = useMemo(() => {
+    const grouped = new Map<string, PendingElicitationRecord[]>();
+    for (const e of pendingElicitations) {
+      if (e.status !== 'pending') continue;
+      let bucket = grouped.get(e.runId);
+      if (!bucket) {
+        bucket = [];
+        grouped.set(e.runId, bucket);
+      }
+      bucket.push(e);
+    }
+    for (const [runId, nextList] of grouped.entries()) {
+      const prev = prevElicitationsCacheRef.current.get(runId);
+      if (prev && prev.length === nextList.length && prev.every((item, idx) => item === nextList[idx])) {
+        grouped.set(runId, prev);
+      }
+    }
+    prevElicitationsCacheRef.current = grouped;
+    return grouped;
+  }, [pendingElicitations]);
+
+  const renderedRunIds = useMemo(() => {
+    const set = new Set<string>();
+    for (const m of messages) {
+      if (m.runId) set.add(m.runId);
+    }
+    return set;
+  }, [messages]);
+
+  const unmatchedPermissions = useMemo(
+    () => pendingPermissions.filter((p) => p.status === 'pending' && (!p.runId || !renderedRunIds.has(p.runId))),
+    [pendingPermissions, renderedRunIds]
+  );
+
+  const unmatchedElicitations = useMemo(
+    () => pendingElicitations.filter((e) => e.status === 'pending' && (!e.runId || !renderedRunIds.has(e.runId))),
+    [pendingElicitations, renderedRunIds]
+  );
+
   const scheduleScrollToBottom = useCallback(() => {
     if (!isNearBottomRef.current) return;
     if (scrollRafRef.current !== null) return;
@@ -1666,6 +2416,7 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
     lastMsg?.artifactIds.length,
     lastMsgToolSummary,
     pendingPermissions.length,
+    pendingElicitations.length,
     scheduleScrollToBottom,
   ]);
 
@@ -1952,17 +2703,33 @@ export const ChatView: React.FC<ChatViewProps> = React.memo(({
                     : null
                 }
                 msgPerms={msg.runId ? (pendingPermsByRunId.get(msg.runId) ?? EMPTY_PERMS) : EMPTY_PERMS}
+                msgElicitations={msg.runId ? (pendingElicitationsByRunId.get(msg.runId) ?? EMPTY_ELICITATIONS) : EMPTY_ELICITATIONS}
                 msgArtifacts={resolvedArtifactsByMsgId.get(msg.id) ?? EMPTY_ARTIFACTS}
                 isCopyTarget={longPressMenu?.messageKey === getMessageKey(msg)}
                 hapticEnabled={hapticEnabled}
                 onOpenArtifact={onOpenArtifact}
                 onOpenAttachment={openAttachmentRef}
                 onPermissionUpdated={onPermissionUpdated}
+                onElicitationUpdated={onElicitationUpdated}
                 onResolveError={handleResolveError}
                 onOpenLongPressMenu={handleOpenLongPressMenu}
               />
             ))
           )}
+          {unmatchedPermissions.map((perm) => (
+            <div key={perm.id} className="msg-row assistant">
+              <div className="assistant-body">
+                <PermissionCard perm={perm} clientId={clientId} onResolved={onPermissionUpdated} />
+              </div>
+            </div>
+          ))}
+          {unmatchedElicitations.map((elicit) => (
+            <div key={elicit.id} className="msg-row assistant">
+              <div className="assistant-body">
+                <ElicitationCard elicit={elicit} clientId={clientId} onResolved={onElicitationUpdated} />
+              </div>
+            </div>
+          ))}
         </div>
       </div>
 

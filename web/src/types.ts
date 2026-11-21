@@ -277,8 +277,92 @@ export interface PendingPermissionRecord {
   userId: string;
   toolCall: ToolCallItem;
   options: PermissionOptionItem[];
+  alwaysAllowRule?: string | null;
   status: 'pending' | 'resolved' | 'cancelled';
   selectedOptionId: string | null;
+  resolvedByClientId: string | null;
+  createdAt: number;
+  resolvedAt: number | null;
+}
+
+export interface ElicitationEnumOption {
+  const: string;
+  title: string;
+  description?: string | null;
+}
+
+export type ElicitationStringFormat = 'email' | 'uri' | 'date' | 'date-time';
+
+export type ElicitationPropertySchema =
+  | {
+      type: 'string';
+      title?: string | null;
+      description?: string | null;
+      minLength?: number | null;
+      maxLength?: number | null;
+      pattern?: string | null;
+      format?: ElicitationStringFormat | null;
+      default?: string | null;
+      enum?: string[] | null;
+      oneOf?: ElicitationEnumOption[] | null;
+    }
+  | {
+      type: 'number' | 'integer';
+      title?: string | null;
+      description?: string | null;
+      minimum?: number | null;
+      maximum?: number | null;
+      default?: number | null;
+    }
+  | {
+      type: 'boolean';
+      title?: string | null;
+      description?: string | null;
+      default?: boolean | null;
+    }
+  | {
+      type: 'array';
+      title?: string | null;
+      description?: string | null;
+      minItems?: number | null;
+      maxItems?: number | null;
+      default?: string[] | null;
+      items:
+        | { type?: 'string'; enum: string[] }
+        | { anyOf: ElicitationEnumOption[] }
+        | { type: string; [key: string]: unknown };
+    }
+  | {
+      type: string;
+      title?: string | null;
+      description?: string | null;
+      [key: string]: unknown;
+    };
+
+export interface ElicitationFormSchema {
+  type?: 'object';
+  title?: string | null;
+  description?: string | null;
+  properties: Record<string, ElicitationPropertySchema>;
+  required?: string[] | null;
+}
+
+export type ElicitationContentValue = string | number | boolean | string[];
+
+export interface PendingElicitationRecord {
+  id: string;
+  runId: string;
+  chatId: string;
+  userId: string;
+  toolCallId: string | null;
+  externalElicitationId: string | null;
+  mode: 'form' | 'url';
+  message: string;
+  requestedSchema: ElicitationFormSchema | null;
+  url: string | null;
+  status: 'pending' | 'resolved' | 'cancelled';
+  selectedAction: 'accept' | 'decline' | 'cancel' | null;
+  responseContent: Record<string, ElicitationContentValue> | null;
   resolvedByClientId: string | null;
   createdAt: number;
   resolvedAt: number | null;
@@ -361,6 +445,7 @@ export interface ChatDetailResponse {
   messages: MessageRecord[];
   artifacts: ArtifactRecord[];
   pendingPermissions: PendingPermissionRecord[];
+  pendingElicitations: PendingElicitationRecord[];
   activeRun: RunRecord | null;
   project: ProjectRecord | null;
   sessionOptions: ParsedSessionOptions | null;
@@ -451,6 +536,9 @@ export interface McpServerRecord {
   transport: McpTransport;
   enabled: boolean;
   allowedTools: string[];
+  disabledTools: string[];
+  alwaysAllowTools: string[];
+  discoveredTools: McpDiscoveredTool[];
   command: string | null;
   args: string[];
   env: McpSecretEntrySummary[];
@@ -477,4 +565,5 @@ export interface McpTestResult {
     scopes?: string[];
   };
 }
+
 

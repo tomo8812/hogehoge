@@ -42,7 +42,21 @@ const sendMessageSchema = z.object({
 
 const permissionActionSchema = z.object({
   optionId: z.string().nullable().optional(),
+  alwaysAllow: z.boolean().optional(),
   cancel: z.boolean().optional(),
+  clientId: z.string().max(128).optional().nullable(),
+});
+
+const elicitationContentValueSchema = z.union([
+  z.string(),
+  z.number(),
+  z.boolean(),
+  z.array(z.string()),
+]);
+
+const elicitationActionSchema = z.object({
+  action: z.enum(['accept', 'decline', 'cancel']),
+  content: z.record(z.string(), elicitationContentValueSchema).nullable().optional(),
   clientId: z.string().max(128).optional().nullable(),
 });
 
@@ -171,6 +185,7 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
     const messages = db.listMessages(session.user.id, chatId);
     const artifacts = db.listArtifactsForChat(session.user.id, chatId);
     const pendingPermissions = db.listPendingPermissionsForChat(session.user.id, chatId);
+    const pendingElicitations = db.listPendingElicitationsForChat(session.user.id, chatId);
     const activeRun = db.getActiveRunForChat(session.user.id, chatId);
     const project = chat.projectId ? db.getProject(session.user.id, chat.projectId) : null;
 
@@ -188,6 +203,7 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
       messages,
       artifacts,
       pendingPermissions,
+      pendingElicitations,
       activeRun,
       project,
       sessionOptions,
@@ -444,6 +460,7 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
       chatId,
       permissionId,
       selectedOptionId: parsed.data.optionId ?? null,
+      alwaysAllow: parsed.data.alwaysAllow ?? false,
       cancel: parsed.data.cancel ?? false,
       clientId: parsed.data.clientId,
     });
@@ -455,5 +472,45 @@ export async function registerChatRoutes(app: FastifyInstance, deps: ChatRouteDe
       });
     }
     return { permission: resolved };
+  });
+
+  app.post('/api/chats/:chatId/elicitations/:elicitationId', async (req, reply) => {
+    const session = requireAuth(req, reply, db);
+    if (!session) return;
+    const { chatId, elicitationId } = req.params as { chatId: string; elicitationId: string };
+    const parsed = elicitationActionSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'INVALID_INPUT', message: '入力値が不正です。' });
+    }
+
+    const existing = db.getElicitation(session.user.id, elicitationId);
+    if (!existing || existing.chatId !== chatId) {
+      return reply.code(404).send({ error: 'NOT_FOUND', message: '質問リクエストが見つかりません。' });
+    }
+
+    if (existing.status !== 'pending') {
+      return reply.code(409).send({
+        error: 'ALREADY_RESOLVED',
+        message: 'この質問リクエストは既に処理済みです。',
+        elicitation: existing,
+      });
+    }
+
+    const resolved = acp.resolvePendingElicitation({
+      userId: session.user.id,
+      chatId,
+      elicitationId,
+      action: parsed.data.action,
+      content: parsed.data.content ?? null,
+      clientId: parsed.data.clientId,
+    });
+
+    if (!resolved) {
+      return reply.code(409).send({
+        error: 'ALREADY_RESOLVED',
+        message: 'この質問リクエストは既に処理済みです。',
+      });
+    }
+    return { elicitation: resolved };
   });
 }

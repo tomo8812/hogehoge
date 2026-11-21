@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
+import { getAgyPermissionRules } from '../src/acp/profile-settings.js';
 import {
   createTestServer,
   registerAndBindAgy,
@@ -1446,5 +1447,262 @@ describe('Admin-Only MCP Server Management, Scope Isolation, and Remote OAuth 2.
     );
     expect(resolvedExplicitFalse.some((s) => s.name === 'tinyfish-cimd')).toBe(false);
   });
+
+  it('persists discoveredTools, filters disabledTools, and syncs alwaysAllowTools to settings.json permissions.allow', async () => {
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+
+    const { client: admin, userId: adminUserId } = await registerAndBindAgy(srv.baseUrl, 'syncadmin', 'user:sync-admin');
+    const { userId: memberUserId } = await registerAndBindAgy(srv.baseUrl, 'syncmember', 'user:sync-member');
+
+    let remoteBaseUrl = '';
+    const mockHttpMcp = http.createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(Buffer.from(c));
+      const rpc = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+        id?: number | string;
+        method: string;
+        params?: { name?: string };
+      };
+      if (rpc.method === 'initialize') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'perm-mcp', version: '1.0' } },
+        }));
+        return;
+      }
+      if (rpc.method === 'notifications/initialized') {
+        res.writeHead(202).end();
+        return;
+      }
+      if (rpc.method === 'tools/list') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          result: {
+            tools: [
+              { name: 'tool_alpha', description: 'Alpha tool full description' },
+              { name: 'tool_beta', description: 'Beta tool full description' },
+              { name: 'tool_gamma', description: 'Gamma tool full description' },
+            ],
+          },
+        }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => mockHttpMcp.listen(0, '127.0.0.1', resolve));
+    httpServers.push(mockHttpMcp);
+    const port = (mockHttpMcp.address() as { port: number }).port;
+    remoteBaseUrl = `http://127.0.0.1:${port}`;
+
+    // 1) Create shared MCP server
+    const createRes = await admin.request<{ server: { id: string; discoveredTools: unknown[] } }>(
+      'POST',
+      '/api/mcp/servers',
+      {
+        name: 'perm-sync-mcp',
+        scope: 'shared',
+        transport: 'http',
+        url: `${remoteBaseUrl}/mcp`,
+        authType: 'none',
+      }
+    );
+    expect(createRes.status).toBe(201);
+    const serverId = createRes.data.server.id;
+    expect(createRes.data.server.discoveredTools).toEqual([]);
+
+    // 2) Test persists discoveredTools in DB and returns updated server
+    const testRes = await admin.request<{
+      result: { ok: boolean; tools?: Array<{ name: string; description?: string }> };
+      server?: { discoveredTools: Array<{ name: string; description?: string }> };
+    }>('POST', `/api/mcp/servers/${serverId}/test`, {});
+    expect(testRes.status).toBe(200);
+    expect(testRes.data.result.ok).toBe(true);
+    expect(testRes.data.server?.discoveredTools).toHaveLength(3);
+
+    // 3) Setting tool_alpha to alwaysAllow writes mcp(perm-sync-mcp/tool_alpha) to all profiles' settings.json
+    const allowRes = await admin.request<{ server: { alwaysAllowTools: string[] } }>(
+      'PATCH',
+      `/api/mcp/servers/${serverId}`,
+      { alwaysAllowTools: ['tool_alpha'] }
+    );
+    expect(allowRes.status).toBe(200);
+    expect(allowRes.data.server.alwaysAllowTools).toEqual(['tool_alpha']);
+
+    const adminProfile = srv.ctx.db.getAgyProfile(adminUserId)!;
+    const memberProfile = srv.ctx.db.getAgyProfile(memberUserId)!;
+    expect(getAgyPermissionRules(adminProfile.profileDir).allow).toContain('mcp(perm-sync-mcp/tool_alpha)');
+    expect(getAgyPermissionRules(memberProfile.profileDir).allow).toContain('mcp(perm-sync-mcp/tool_alpha)');
+
+    // 4) Reverting back to Ask (alwaysAllowTools: []) removes the rule from settings.json
+    const askRes = await admin.request<{ server: { alwaysAllowTools: string[] } }>(
+      'PATCH',
+      `/api/mcp/servers/${serverId}`,
+      { alwaysAllowTools: [] }
+    );
+    expect(askRes.status).toBe(200);
+    expect(getAgyPermissionRules(adminProfile.profileDir).allow).not.toContain('mcp(perm-sync-mcp/tool_alpha)');
+    expect(getAgyPermissionRules(memberProfile.profileDir).allow).not.toContain('mcp(perm-sync-mcp/tool_alpha)');
+
+    // 5) Disabling tool_beta excludes it from ACP tools AND excludes it from permissions.allow even if listed
+    const disableRes = await admin.request<{
+      server: { disabledTools: string[]; alwaysAllowTools: string[] };
+    }>('PATCH', `/api/mcp/servers/${serverId}`, {
+      disabledTools: ['tool_beta'],
+      alwaysAllowTools: ['tool_alpha', 'tool_beta'],
+    });
+    expect(disableRes.status).toBe(200);
+    expect(getAgyPermissionRules(adminProfile.profileDir).allow).toContain('mcp(perm-sync-mcp/tool_alpha)');
+    expect(getAgyPermissionRules(adminProfile.profileDir).allow).not.toContain('mcp(perm-sync-mcp/tool_beta)');
+
+    const acpServers = await srv.ctx.mcpService.resolveAcpMcpServersForUser(memberUserId);
+    const acpTarget = acpServers.find((s) => s.name === 'perm-sync-mcp') as { url: string };
+    const listResp = await fetch(acpTarget.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    });
+    const listJson = (await listResp.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(listJson.result.tools.map((t) => t.name)).toEqual(['tool_alpha', 'tool_gamma']);
+
+    // 6) Newly registered user also receives shared alwaysAllow rules in settings.json
+    const { userId: newUserId } = await registerAndBindAgy(srv.baseUrl, 'latejoiner', 'user:late@gmail.com');
+    const lateProfile = srv.ctx.db.getAgyProfile(newUserId)!;
+    expect(getAgyPermissionRules(lateProfile.profileDir).allow).toContain('mcp(perm-sync-mcp/tool_alpha)');
+
+    // 7) Deleting the MCP server cleans up its mcp(...) rules from settings.json
+    const delRes = await admin.request('DELETE', `/api/mcp/servers/${serverId}`);
+    expect(delRes.status).toBe(200);
+    expect(getAgyPermissionRules(adminProfile.profileDir).allow).not.toContain('mcp(perm-sync-mcp/tool_alpha)');
+    expect(getAgyPermissionRules(memberProfile.profileDir).allow).not.toContain('mcp(perm-sync-mcp/tool_alpha)');
+    expect(getAgyPermissionRules(lateProfile.profileDir).allow).not.toContain('mcp(perm-sync-mcp/tool_alpha)');
+  });
+
+  it('enforces disabledTools before tool discovery and prevents non-owners from mutating shared alwaysAllowTools from chat', async () => {
+    const srv = await createTestServer({ allowPrivateMcpUrls: true });
+    servers.push(srv);
+
+    const mockHttpMcp = http.createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(Buffer.from(c));
+      const rpc = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+        id?: number | string;
+        method: string;
+        params?: { name?: string };
+      };
+      if (rpc.method === 'initialize') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'pre-disc-mcp', version: '1.0' } },
+        }));
+        return;
+      }
+      if (rpc.method === 'notifications/initialized') {
+        res.writeHead(202).end();
+        return;
+      }
+      if (rpc.method === 'tools/list') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          result: {
+            tools: [
+              { name: 'safe_tool', description: 'Safe tool' },
+              { name: 'danger_tool', description: 'Dangerous tool' },
+            ],
+          },
+        }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => mockHttpMcp.listen(0, '127.0.0.1', resolve));
+    httpServers.push(mockHttpMcp);
+    const port = (mockHttpMcp.address() as { port: number }).port;
+    const upstreamUrl = `http://127.0.0.1:${port}`;
+
+    const { client: admin, userId: adminUserId } = await registerAndBindAgy(srv.baseUrl, 'admin', 'user:admin@gmail.com');
+    const { client: member, userId: memberUserId } = await registerAndBindAgy(srv.baseUrl, 'member', 'user:member@gmail.com');
+
+    // Create shared MCP with disabledTools BEFORE any discovery (discoveredToolsJson stays '[]')
+    const sharedCreate = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'pre-discovery-shared',
+      scope: 'shared',
+      transport: 'http',
+      url: upstreamUrl,
+      disabledTools: ['danger_tool'],
+    });
+    expect(sharedCreate.status).toBe(201);
+    const sharedId = sharedCreate.data.server.id;
+    expect(srv.ctx.db.getMcpServerById(sharedId)?.discoveredToolsJson).toBe('[]');
+
+    const acpServers = await srv.ctx.mcpService.resolveAcpMcpServersForUser(memberUserId);
+    const acpTarget = acpServers.find((s) => s.name === 'pre-discovery-shared') as { url: string };
+    expect(acpTarget?.url).toBeTruthy();
+
+    const listResp = await fetch(acpTarget.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    });
+    const listJson = (await listResp.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(listJson.result.tools.map((t) => t.name)).toEqual(['safe_tool']);
+
+    const callDisabledResp = await fetch(acpTarget.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'danger_tool', arguments: {} } }),
+    });
+    const callDisabledJson = (await callDisabledResp.json()) as { error?: { code: number } };
+    expect(callDisabledJson.error?.code).toBe(-32602);
+
+    // Profile server owned by admin gets updated only by admin, while shared server is untouched
+    const profileCreate = await admin.request<{ server: { id: string } }>('POST', '/api/mcp/servers', {
+      name: 'admin-profile-mcp',
+      scope: 'profile',
+      transport: 'http',
+      url: upstreamUrl,
+    });
+    expect(profileCreate.status).toBe(201);
+    const profileId = profileCreate.data.server.id;
+
+    srv.ctx.mcpService.recordToolAlwaysAllowFromChat(memberUserId, 'pre-discovery-shared', 'safe_tool');
+    srv.ctx.mcpService.recordToolAlwaysAllowFromChat(adminUserId, 'pre-discovery-shared', 'safe_tool');
+    expect(JSON.parse(srv.ctx.db.getMcpServerById(sharedId)!.alwaysAllowToolsJson)).toEqual([]);
+
+    srv.ctx.mcpService.recordToolAlwaysAllowFromChat(memberUserId, 'admin-profile-mcp', 'safe_tool');
+    expect(JSON.parse(srv.ctx.db.getMcpServerById(profileId)!.alwaysAllowToolsJson)).toEqual([]);
+
+    srv.ctx.mcpService.recordToolAlwaysAllowFromChat(adminUserId, 'admin-profile-mcp', 'safe_tool');
+    expect(JSON.parse(srv.ctx.db.getMcpServerById(profileId)!.alwaysAllowToolsJson)).toEqual(['safe_tool']);
+
+    // Personal chat allow rule on a shared server stays in member's settings.json without leaking into shared toPublicRecord
+    const { addAgyAllowPermissionRule } = await import('../src/acp/profile-settings.js');
+    const memberProfile = srv.ctx.db.getAgyProfile(memberUserId)!;
+    addAgyAllowPermissionRule(memberProfile.profileDir, 'mcp(pre-discovery-shared/safe_tool)');
+
+    const adminList = await admin.request<{ servers: Array<{ id: string; alwaysAllowTools: string[] }> }>(
+      'GET',
+      '/api/mcp/servers'
+    );
+    const sharedFromApi = adminList.data.servers.find((s) => s.id === sharedId);
+    expect(sharedFromApi?.alwaysAllowTools).toEqual([]);
+
+    // Admin PATCH or startup sync preserves member's personal chat allow rule on pre-discovery-shared
+    const patchShared = await admin.request('PATCH', `/api/mcp/servers/${sharedId}`, {
+      description: 'Updated description',
+    });
+    expect(patchShared.status).toBe(200);
+    srv.ctx.mcpService.syncAllSharedMcpPermissionsToProfile(memberProfile.profileDir);
+    expect(getAgyPermissionRules(memberProfile.profileDir).allow).toContain('mcp(pre-discovery-shared/safe_tool)');
+  });
 });
+
 
