@@ -1106,13 +1106,13 @@ export class AcpClientManager {
           this.db.withAgyProfileSettingsWrite(() => {
             addAgyAllowPermissionRule(profile.profileDir, existing.alwaysAllowRule!);
           });
+          const mcpMatch = /^mcp\(([^/]+)\/(.+)\)$/.exec(existing.alwaysAllowRule);
+          if (mcpMatch) {
+            this.mcpService?.recordToolAlwaysAllowFromChat(params.userId, mcpMatch[1], mcpMatch[2]);
+          }
         } catch (err) {
           console.warn('[acp] Failed to persist always-allow permission rule:', err);
         }
-      }
-      const mcpMatch = /^mcp\(([^/]+)\/(.+)\)$/.exec(existing.alwaysAllowRule);
-      if (mcpMatch) {
-        this.mcpService?.recordToolAlwaysAllowFromChat(params.userId, mcpMatch[1], mcpMatch[2]);
       }
     }
 

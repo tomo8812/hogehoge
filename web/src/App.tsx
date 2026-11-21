@@ -1231,7 +1231,7 @@ export const App: React.FC = () => {
         if (perm) {
           setChats((prev) =>
             prev.map((c) =>
-              c.id === perm.chatId && c.activeRun
+              c.id === perm.chatId && c.activeRun?.id === perm.runId
                 ? { ...c, activeRun: { ...c.activeRun, status: 'awaiting_permission' } }
                 : c
             )
@@ -1294,7 +1294,9 @@ export const App: React.FC = () => {
           if (!stillPendingForRun) {
             setChats((prev) =>
               prev.map((c) =>
-                c.id === perm.chatId && c.activeRun?.status === 'awaiting_permission'
+                c.id === perm.chatId &&
+                c.activeRun?.id === perm.runId &&
+                c.activeRun.status === 'awaiting_permission'
                   ? { ...c, activeRun: { ...c.activeRun, status: 'running' } }
                   : c
               )
@@ -1315,7 +1317,7 @@ export const App: React.FC = () => {
         if (elicit) {
           setChats((prev) =>
             prev.map((c) =>
-              c.id === elicit.chatId && c.activeRun
+              c.id === elicit.chatId && c.activeRun?.id === elicit.runId
                 ? { ...c, activeRun: { ...c.activeRun, status: 'awaiting_permission' } }
                 : c
             )
@@ -1375,7 +1377,9 @@ export const App: React.FC = () => {
           if (!stillPendingForRun) {
             setChats((prev) =>
               prev.map((c) =>
-                c.id === elicit.chatId && c.activeRun?.status === 'awaiting_permission'
+                c.id === elicit.chatId &&
+                c.activeRun?.id === elicit.runId &&
+                c.activeRun.status === 'awaiting_permission'
                   ? { ...c, activeRun: { ...c.activeRun, status: 'running' } }
                   : c
               )
