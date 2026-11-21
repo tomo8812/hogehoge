@@ -152,7 +152,6 @@ function extractSkillsFromTarball(tarballPath, stageExtractDir, skillSlugs) {
 
   const wantedSet = new Set(skillSlugs);
   const selectedFiles = [];
-  const selectedAll = new Set();
 
   for (const rawLine of rawNames.split('\n')) {
     const entryName = rawLine.replace(/\r$/, '');
@@ -169,7 +168,6 @@ function extractSkillsFromTarball(tarballPath, stageExtractDir, skillSlugs) {
     if (restParts[0] !== 'skills' || restParts.length < 2 || !wantedSet.has(restParts[1])) {
       continue;
     }
-    selectedAll.add(cleanEntry);
     if (!isDir && restParts.length >= 3) {
       selectedFiles.push(entryName);
     }
