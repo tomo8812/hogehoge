@@ -694,9 +694,15 @@ run_app_update() {
   if [[ -f "${APP_DIR}/scripts/fetch-anthropic-skills.mjs" ]]; then
     echo "[auto-update] Fetching latest Anthropic document skills into ${APP_DIR}/builtin-skills..."
     run_as_owner node "${APP_DIR}/scripts/fetch-anthropic-skills.mjs" --best-effort --out "${APP_DIR}/builtin-skills" || true
+    if [[ -d "${APP_DIR}/builtin-skills" ]]; then
+      if [[ "$(id -u)" -eq 0 ]]; then
+        chown -R root:root "${APP_DIR}/builtin-skills" 2>/dev/null || true
+      fi
+      chmod -R u+rwX,go+rX,go-w "${APP_DIR}/builtin-skills" 2>/dev/null || true
+    fi
   fi
 
-  if [[ "$(id -u)" -eq 0 ]] && [[ "${AUTO_SETUP_DOC_RUNTIME:-1}" == "1" ]] && [[ -f "${APP_DIR}/deploy/setup-doc-runtime.sh" ]]; then
+  if [[ "$(id -u)" -eq 0 ]] && [[ -f "${APP_DIR}/deploy/setup-doc-runtime.sh" ]]; then
     bash "${APP_DIR}/deploy/setup-doc-runtime.sh" || echo "[auto-update] WARNING: isolated doc-runtime provisioning failed; continuing." >&2
   fi
 

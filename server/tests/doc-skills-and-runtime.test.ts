@@ -2,312 +2,595 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
-import { buildAgyCommandSpec, SANDBOX_DOC_RUNTIME_MOUNT } from '../src/acp/env-isolation.js';
-import { loadConfig } from '../src/config.js';
+import { describe, expect, test } from 'vitest';
+import {
+  buildAgyCommandSpec,
+  ensurePerChatHomeDir,
+  SANDBOX_DOC_RUNTIME_MOUNT,
+  SANDBOX_HOME_MOUNT,
+} from '../src/acp/env-isolation.js';
+import type { AppConfig } from '../src/config.js';
+import { resolveAuthorizedChatFileReference } from '../src/files/link-resolver.js';
+import {
+  BUILTIN_STATE_FILENAME,
+  LEGACY_BUILTIN_SYNC_MARKER,
+  listCustomGlobalSkillSlugs,
+  migrateLegacySyncedBuiltins,
+  readProfileDisabledBuiltins,
+  resolveActiveBuiltinSkillsForProfile,
+} from '../src/skills/builtin-skills.js';
+import type { SkillsListResponse } from '../src/types.js';
 import { createTestServer, registerAndBindAgy } from './helpers/test-harness.js';
 
-interface FetchSkillsApi {
-  fetchAnthropicSkills: (opts: {
-    outDir?: string;
-    tarballPath?: string;
-    fromDir?: string;
-    skills?: string[];
-  }) => Promise<{
-    outDir: string;
-    manifest: {
-      source: string;
-      manifestDigest: string;
-      skills: Record<string, { sha256: string; fileCount: number }>;
-    };
-  }>;
-  hasValidBuiltinSkillsCache: (outDir: string, skills?: string[]) => boolean;
-}
-
-function hasContiguousSlice(arr: string[], sub: string[]): boolean {
-  for (let i = 0; i <= arr.length - sub.length; i++) {
-    if (sub.every((v, idx) => arr[i + idx] === v)) return true;
+function writeSkillDir(
+  parentDir: string,
+  slug: string,
+  opts: {
+    name?: string;
+    description?: string;
+    instructions?: string;
+    files?: Record<string, string>;
+    legacyMarker?: boolean;
+  } = {},
+): string {
+  const dir = path.join(parentDir, slug);
+  fs.mkdirSync(dir, { recursive: true });
+  const name = opts.name ?? slug;
+  const description = opts.description ?? `${slug} skill description`;
+  const instructions = opts.instructions ?? `# ${slug}\nUse this skill for ${slug}.`;
+  fs.writeFileSync(
+    path.join(dir, 'SKILL.md'),
+    `---\nname: ${JSON.stringify(name)}\ndescription: ${JSON.stringify(description)}\n---\n\n${instructions}\n`,
+    'utf8',
+  );
+  if (opts.files) {
+    for (const [rel, content] of Object.entries(opts.files)) {
+      const target = path.join(dir, rel);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, content, 'utf8');
+    }
   }
-  return false;
+  if (opts.legacyMarker) {
+    fs.writeFileSync(path.join(dir, LEGACY_BUILTIN_SYNC_MARKER), 'builtin-sync-v1', 'utf8');
+  }
+  return dir;
 }
 
-async function loadFetchSkillsScript(): Promise<FetchSkillsApi> {
-  const scriptPath = path.resolve(import.meta.dirname, '..', '..', 'scripts', 'fetch-anthropic-skills.mjs');
-  return (await import(pathToFileURL(scriptPath).href)) as FetchSkillsApi;
+function seedBuiltinCatalog(rootDir: string, versionTag = 'v1'): string {
+  const builtinDir = path.join(rootDir, 'builtin-skills');
+  fs.mkdirSync(builtinDir, { recursive: true });
+  for (const slug of ['docx', 'pptx', 'xlsx', 'pdf']) {
+    writeSkillDir(builtinDir, slug, {
+      name: `${slug}-${versionTag}`,
+      description: `Anthropic ${slug} (${versionTag})`,
+      instructions: `# ${slug} (${versionTag})\nOfficial built-in workflow (${versionTag}).`,
+      files: slug === 'docx' ? { 'scripts/render.py': `print("docx-${versionTag}")\n` } : undefined,
+    });
+  }
+  fs.writeFileSync(
+    path.join(builtinDir, '.builtin-skills-manifest.json'),
+    JSON.stringify({
+      version: 1,
+      skills: {
+        docx: { sha256: `sha-docx-${versionTag}` },
+        pptx: { sha256: `sha-pptx-${versionTag}` },
+        xlsx: { sha256: `sha-xlsx-${versionTag}` },
+        pdf: { sha256: `sha-pdf-${versionTag}` },
+      },
+    }),
+    'utf8',
+  );
+  return builtinDir;
 }
 
-describe('Dynamic Anthropic Document Skills & Isolated Sandbox Runtime', () => {
-  const cleanups: Array<() => Promise<void> | void> = [];
+type ApiSkillsList = {
+  global: Array<{
+    slug: string;
+    origin?: string;
+    hasBuiltinConflict?: boolean;
+    storageKind?: string;
+    enabled: boolean;
+  }>;
+  commands: Array<{ name: string; source?: string }>;
+};
 
-  afterEach(async () => {
-    while (cleanups.length > 0) {
-      await cleanups.pop()!();
-    }
-  });
-
-  it('fetches and verifies document skills from archive, rejects unsafe tar entries, and handles best-effort cache fallback', async () => {
-    const api = await loadFetchSkillsScript();
-    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fetch-skills-test-'));
-    cleanups.push(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));
-
-    // Build a realistic mock anthropics/skills tarball
-    const repoStage = path.join(tmpRoot, 'skills-main');
-    for (const slug of ['docx', 'pptx', 'xlsx', 'pdf']) {
-      const skillDir = path.join(repoStage, 'skills', slug, 'scripts');
-      fs.mkdirSync(skillDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(repoStage, 'skills', slug, 'SKILL.md'),
-        `---\nname: ${slug}\ndescription: "Handle ${slug} documents"\n---\n\nUse ${slug} scripts.\n`
-      );
-      fs.writeFileSync(path.join(skillDir, 'helper.py'), `print("${slug}")\n`, { mode: 0o644 });
-    }
-    const validTar = path.join(tmpRoot, 'valid-skills.tar.gz');
-    execFileSync('tar', ['-czf', validTar, '-C', tmpRoot, 'skills-main']);
-
-    const outDir = path.join(tmpRoot, 'builtin-skills');
-    const fetched = await api.fetchAnthropicSkills({ outDir, tarballPath: validTar });
-    expect(Object.keys(fetched.manifest.skills).sort()).toEqual(['docx', 'pdf', 'pptx', 'xlsx']);
-    expect(api.hasValidBuiltinSkillsCache(outDir)).toBe(true);
-    expect(fs.existsSync(path.join(outDir, 'pptx', 'SKILL.md'))).toBe(true);
-    expect(fs.statSync(path.join(outDir, 'pptx', 'scripts', 'helper.py')).mode & 0o111).not.toBe(0);
-
-    // Symlink inside selected skill in archive must be rejected
-    const badStage = path.join(tmpRoot, 'bad-repo');
-    fs.mkdirSync(path.join(badStage, 'skills', 'docx'), { recursive: true });
-    fs.writeFileSync(path.join(badStage, 'skills', 'docx', 'SKILL.md'), '---\nname: docx\ndescription: x\n---\n');
-    fs.symlinkSync('/etc/passwd', path.join(badStage, 'skills', 'docx', 'leak.txt'));
-    const badTar = path.join(tmpRoot, 'bad-skills.tar.gz');
-    execFileSync('tar', ['-czf', badTar, '-C', tmpRoot, 'bad-repo']);
-
-    await expect(
-      api.fetchAnthropicSkills({ outDir: path.join(tmpRoot, 'out-bad'), tarballPath: badTar })
-    ).rejects.toThrow(/Unsupported non-regular entry/);
-
-    // CLI --best-effort preserves valid cache when network/URL fails
-    const scriptPath = path.resolve(import.meta.dirname, '..', '..', 'scripts', 'fetch-anthropic-skills.mjs');
-    execFileSync(
-      process.execPath,
-      [scriptPath, '--out', outDir, '--tarball-url', 'http://127.0.0.1:1/unreachable.tar.gz', '--best-effort'],
-      { encoding: 'utf8' }
-    );
-    expect(api.hasValidBuiltinSkillsCache(outDir)).toBe(true);
-  });
-
-  it('provisions bundled Anthropic document skills to all profiles and preserves user disable, edit, delete, and custom overrides', async () => {
-    const api = await loadFetchSkillsScript();
-    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-builtin-sync-test-'));
-    cleanups.push(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));
-
-    const srcV1 = path.join(tmpRoot, 'upstream-v1');
-    for (const [slug, ver] of [
-      ['docx', 'v1'],
-      ['pptx', 'v1'],
-      ['xlsx', 'v1'],
-      ['pdf', 'v1'],
-    ]) {
-      const sDir = path.join(srcV1, 'skills', slug, 'scripts');
-      fs.mkdirSync(sDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(srcV1, 'skills', slug, 'SKILL.md'),
-        `---\nname: ${slug}\ndescription: "Anthropic ${slug} (${ver})"\n---\n\n${slug.toUpperCase()}_${ver}\n`
-      );
-      fs.writeFileSync(path.join(sDir, 'run.py'), `print("${slug}_${ver}")\n`);
-    }
-
-    const builtinSkillsDir = path.join(tmpRoot, 'builtin-skills');
-    await api.fetchAnthropicSkills({ outDir: builtinSkillsDir, fromDir: srcV1 });
-
-    // Start server with bundled skills -> register alice & bob
+describe('Anthropic doc skills and runtime isolation', () => {
+  test('Built-in vs Custom skills: read-only enforcement, per-user state across updates, and collision protection', async () => {
+    const builtinRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-builtin-catalog-'));
+    const builtinSkillsDir = seedBuiltinCatalog(builtinRoot, 'v1');
     const srv = await createTestServer({ builtinSkillsDir });
-    cleanups.push(srv.cleanup);
 
-    const { client: alice, userId: aliceId } = await registerAndBindAgy(
-      srv.baseUrl,
-      'alice',
-      'user:alice@gmail.com'
-    );
-    const { client: bob, userId: bobId } = await registerAndBindAgy(
-      srv.baseUrl,
-      'bob',
-      'user:bob@gmail.com'
-    );
+    try {
+      const alice = await registerAndBindAgy(srv.baseUrl, 'alice_doc', 'alice-doc');
+      const bob = await registerAndBindAgy(srv.baseUrl, 'bob_doc', 'bob-doc');
 
-    const aliceSkills = await alice.request<{
-      global: Array<{ slug: string; enabled: boolean; resourceCount: number }>;
-      commands: Array<{ name: string }>;
-    }>('GET', '/api/skills');
-    expect(aliceSkills.status).toBe(200);
-    expect(aliceSkills.data.global.map((s) => s.slug).sort()).toEqual(['docx', 'pdf', 'pptx', 'xlsx']);
-    expect(aliceSkills.data.global.find((s) => s.slug === 'pptx')?.resourceCount).toBe(1);
-    expect(aliceSkills.data.commands.map((c) => c.name)).toEqual(
-      expect.arrayContaining(['docx', 'pdf', 'pptx', 'xlsx'])
-    );
-
-    const bobSkills = await bob.request<{ global: Array<{ slug: string }> }>('GET', '/api/skills');
-    expect(bobSkills.data.global.map((s) => s.slug).sort()).toEqual(['docx', 'pdf', 'pptx', 'xlsx']);
-
-    // Alice disables pptx, customizes docx, and deletes pdf
-    expect((await alice.request('PUT', '/api/skills/global/pptx', { enabled: false })).status).toBe(200);
-    expect(
-      (
-        await alice.request('PUT', '/api/skills/global/docx', {
-          name: 'docx',
-          description: 'Custom docx',
-          instructions: 'ALICE_CUSTOM_DOCX',
-        })
-      ).status
-    ).toBe(200);
-    expect((await alice.request('DELETE', '/api/skills/global/pdf')).status).toBe(200);
-
-    // Bundle updates to v2
-    const srcV2 = path.join(tmpRoot, 'upstream-v2');
-    for (const slug of ['docx', 'pptx', 'xlsx', 'pdf']) {
-      const sDir = path.join(srcV2, 'skills', slug, 'scripts');
-      fs.mkdirSync(sDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(srcV2, 'skills', slug, 'SKILL.md'),
-        `---\nname: ${slug}\ndescription: "Anthropic ${slug} (v2)"\n---\n\n${slug.toUpperCase()}_v2\n`
-      );
-      fs.writeFileSync(path.join(sDir, 'run.py'), `print("${slug}_v2")\n`);
-    }
-    await api.fetchAnthropicSkills({ outDir: builtinSkillsDir, fromDir: srcV2 });
-
-    // Re-sync all profiles (simulating app restart with updated bundle)
-    srv.ctx.skillService.syncBuiltinSkillsToAllProfiles();
-
-    const aliceAfter = await alice.request<{
-      global: Array<{ slug: string; enabled: boolean; description: string }>;
-    }>('GET', '/api/skills');
-    // pdf stays deleted
-    expect(aliceAfter.data.global.some((s) => s.slug === 'pdf')).toBe(false);
-    // pptx stays disabled, and its disabled copy is updated to v2
-    const alicePptx = aliceAfter.data.global.find((s) => s.slug === 'pptx');
-    expect(alicePptx?.enabled).toBe(false);
-    expect(alicePptx?.description).toContain('v2');
-    // docx keeps Alice's customization
-    const aliceDocx = await alice.request<{ skill: { instructions: string } }>('GET', '/api/skills/global/docx');
-    expect(aliceDocx.data.skill.instructions).toBe('ALICE_CUSTOM_DOCX');
-    // xlsx (unmodified) auto-updates to v2
-    const aliceXlsx = await alice.request<{ skill: { instructions: string } }>('GET', '/api/skills/global/xlsx');
-    expect(aliceXlsx.data.skill.instructions).toBe('XLSX_v2');
-
-    // Bob's unmodified profile updates all 4 to v2
-    const bobDocx = await bob.request<{ skill: { instructions: string } }>('GET', '/api/skills/global/docx');
-    expect(bobDocx.data.skill.instructions).toBe('DOCX_v2');
-    expect(srv.ctx.db.getAgyProfile(aliceId)?.profileDir).toBeTruthy();
-    expect(srv.ctx.db.getAgyProfile(bobId)?.profileDir).toBeTruthy();
-  });
-
-  it('mounts isolated docRuntimeDir read-only in bwrap and configures PATH, NODE_PATH, and PYTHONPATH for all profiles', () => {
-    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-doc-runtime-test-'));
-    cleanups.push(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));
-
-    const profileDir = path.join(tmpRoot, 'profile');
-    const workspaceDir = path.join(tmpRoot, 'workspace');
-    const docRuntimeDir = path.join(tmpRoot, 'doc-runtime');
-    const venvBin = path.join(docRuntimeDir, 'venv', 'bin');
-    const sitePackages = path.join(docRuntimeDir, 'venv', 'lib', 'python3.12', 'site-packages');
-    const nodeMods = path.join(docRuntimeDir, 'node', 'node_modules');
-    const nodeBin = path.join(nodeMods, '.bin');
-    fs.mkdirSync(workspaceDir, { recursive: true });
-    fs.mkdirSync(venvBin, { recursive: true });
-    fs.mkdirSync(sitePackages, { recursive: true });
-    fs.mkdirSync(nodeBin, { recursive: true });
-
-    const extAgy = path.join(tmpRoot, 'agy');
-    fs.writeFileSync(extAgy, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-
-    const cfg = loadConfig({
-      agyMode: 'real',
-      sandboxMode: 'strict',
-      agyBin: extAgy,
-      bwrapBin: '/usr/bin/bwrap',
-      dataRoot: tmpRoot,
-      docRuntimeDir,
-    });
-
-    const spec = buildAgyCommandSpec({
-      config: cfg,
-      subcommandArgs: ['acp'],
-      profileDir,
-      workspaceDir,
-      enableSandboxBwrap: true,
-    });
-
-    if (process.platform === 'linux') {
-      expect(spec.sandboxed).toBe(true);
-      expect(
-        hasContiguousSlice(spec.args, ['--ro-bind', fs.realpathSync(docRuntimeDir), SANDBOX_DOC_RUNTIME_MOUNT])
-      ).toBe(true);
-      if (fs.existsSync('/etc/fonts')) {
-        expect(hasContiguousSlice(spec.args, ['--ro-bind', fs.realpathSync('/etc/fonts'), '/etc/fonts'])).toBe(
-          true
-        );
+      // 1. Both users see Built-in skills with origin='builtin', zero files copied to profileDir
+      const aliceList1 = await alice.client.request<ApiSkillsList>('GET', '/api/skills');
+      expect(aliceList1.status).toBe(200);
+      for (const slug of ['docx', 'pptx', 'xlsx', 'pdf']) {
+        const found = aliceList1.data.global.find((i) => i.slug === slug);
+        expect(found, `Expected built-in skill ${slug}`).toBeTruthy();
+        expect(found?.origin).toBe('builtin');
+        expect(Boolean(found?.hasBuiltinConflict)).toBe(false);
+        expect(found?.storageKind).toBe('builtin');
+        expect(found?.enabled).toBe(true);
       }
-      expect(spec.env.PATH?.startsWith('/opt/agy:')).toBe(true);
-      expect(spec.env.PATH).toContain(`${SANDBOX_DOC_RUNTIME_MOUNT}/venv/bin`);
-      expect(spec.env.NODE_PATH).toContain(`${SANDBOX_DOC_RUNTIME_MOUNT}/node/node_modules`);
-      expect(spec.env.PYTHONPATH).toContain(`${SANDBOX_DOC_RUNTIME_MOUNT}/venv/lib/python3.12/site-packages`);
-      expect(spec.env.PYTHONIOENCODING).toBe('utf-8');
-      expect(spec.env.SAL_USE_VCLPLUGIN).toBe('svp');
-    }
 
-    // Also applies cleanly when sandboxMode === 'off'
-    const offCfg = loadConfig({
-      agyMode: 'real',
-      sandboxMode: 'off',
-      agyBin: extAgy,
-      dataRoot: tmpRoot,
-      docRuntimeDir,
-    });
-    const offSpec = buildAgyCommandSpec({
-      config: offCfg,
-      subcommandArgs: ['acp'],
-      profileDir,
-      workspaceDir,
-      enableSandboxBwrap: false,
-    });
-    expect(offSpec.sandboxed).toBe(false);
-    expect(offSpec.env.NODE_PATH).toContain(fs.realpathSync(nodeMods));
-    expect(offSpec.env.PYTHONPATH).toContain(fs.realpathSync(sitePackages));
+      const aliceProfile = srv.ctx.db.getAgyProfile(alice.userId)!;
+      expect(
+        fs.existsSync(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills', 'docx')),
+      ).toBe(false);
+
+      // 2. Built-in detail & resource reads succeed
+      const docxDetail = await alice.client.request<{
+        skill: {
+          origin?: string;
+          hasBuiltinConflict?: boolean;
+          resources: Array<{ relPath: string }>;
+          instructions: string;
+        };
+      }>('GET', '/api/skills/global/docx');
+      expect(docxDetail.status).toBe(200);
+      expect(docxDetail.data.skill.origin).toBe('builtin');
+      expect(docxDetail.data.skill.resources.some((r) => r.relPath === 'scripts/render.py')).toBe(true);
+
+      const resRead = await alice.client.request<{ relPath: string; content: string }>(
+        'GET',
+        '/api/skills/global/docx/files?path=scripts%2Frender.py',
+      );
+      expect(resRead.status).toBe(200);
+      expect(resRead.data.content).toContain('docx-v1');
+
+      // 3. Built-in edits, deletes, resource writes/deletes, and duplicate creation are rejected
+      const putEdit = await alice.client.request<{ error: string }>('PUT', '/api/skills/global/docx', {
+        description: 'Tampered description',
+        instructions: 'Tampered instructions',
+      });
+      expect(putEdit.status).toBe(403);
+      expect(putEdit.data.error).toBe('BUILTIN_SKILL_READONLY');
+
+      const deleteBuiltin = await alice.client.request<{ error: string }>('DELETE', '/api/skills/global/docx');
+      expect(deleteBuiltin.status).toBe(403);
+      expect(deleteBuiltin.data.error).toBe('BUILTIN_SKILL_READONLY');
+
+      const postResourceJson = await alice.client.request<{ error: string }>(
+        'POST',
+        '/api/skills/global/docx/files',
+        { relPath: 'scripts/evil.py', content: 'print("evil")' },
+      );
+      expect(postResourceJson.status).toBe(403);
+      expect(postResourceJson.data.error).toBe('BUILTIN_SKILL_READONLY');
+
+      const form = new FormData();
+      form.append('file', new Blob(['x'], { type: 'text/plain' }), 'note.txt');
+      const postResourceMultipart = await alice.client.request<{ error: string }>(
+        'POST',
+        '/api/skills/global/docx/files?folder=resources',
+        form,
+      );
+      expect(postResourceMultipart.status).toBe(403);
+      expect(postResourceMultipart.data.error).toBe('BUILTIN_SKILL_READONLY');
+
+      const deleteResource = await alice.client.request<{ error: string }>(
+        'DELETE',
+        '/api/skills/global/docx/files?path=scripts%2Frender.py',
+      );
+      expect(deleteResource.status).toBe(403);
+      expect(deleteResource.data.error).toBe('BUILTIN_SKILL_READONLY');
+
+      const createCollision = await alice.client.request<{ error: string }>('POST', '/api/skills', {
+        scope: 'global',
+        slug: 'docx',
+        description: 'Trying to shadow built-in via POST',
+        instructions: 'Blocked',
+      });
+      expect(createCollision.status).toBe(409);
+      expect(createCollision.data.error).toBe('BUILTIN_SKILL_CONFLICT');
+
+      // Verify Built-in files on disk stayed completely untouched
+      expect(fs.readFileSync(path.join(builtinSkillsDir, 'docx', 'scripts', 'render.py'), 'utf8')).toContain(
+        'docx-v1',
+      );
+
+      // 4. Separate per-user enable/disable state survives Built-in updates
+      const disableDocx = await alice.client.request<{
+        skill: { origin?: string; enabled: boolean };
+      }>('PUT', '/api/skills/global/docx', { enabled: false });
+      expect(disableDocx.status).toBe(200);
+      expect(disableDocx.data.skill.origin).toBe('builtin');
+      expect(disableDocx.data.skill.enabled).toBe(false);
+
+      expect(
+        fs.existsSync(path.join(aliceProfile.profileDir, '.gemini', 'config', BUILTIN_STATE_FILENAME)),
+      ).toBe(true);
+      expect(
+        fs.existsSync(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills-disabled', 'docx')),
+      ).toBe(false);
+
+      // Bob still has docx enabled
+      const bobDocx = await bob.client.request<{ skill: { enabled: boolean; origin?: string } }>(
+        'GET',
+        '/api/skills/global/docx',
+      );
+      expect(bobDocx.status).toBe(200);
+      expect(bobDocx.data.skill.origin).toBe('builtin');
+      expect(bobDocx.data.skill.enabled).toBe(true);
+
+      // Simulate Built-in bundle update v1 -> v2
+      seedBuiltinCatalog(builtinRoot, 'v2');
+
+      // Alice keeps docx disabled across update, sees v2 content on pptx and docx
+      const aliceList2 = await alice.client.request<ApiSkillsList>('GET', '/api/skills');
+      expect(aliceList2.data.global.find((i) => i.slug === 'docx')?.enabled).toBe(false);
+      expect(aliceList2.data.global.find((i) => i.slug === 'pptx')?.enabled).toBe(true);
+      expect(aliceList2.data.commands.some((c) => c.name === 'docx')).toBe(false);
+
+      const alicePptxV2 = await alice.client.request<{ skill: { instructions: string } }>(
+        'GET',
+        '/api/skills/global/pptx',
+      );
+      expect(alicePptxV2.data.skill.instructions).toContain('v2');
+
+      // Re-enabling docx succeeds cleanly
+      const reenableDocx = await alice.client.request<{ skill: { enabled: boolean } }>(
+        'PUT',
+        '/api/skills/global/docx',
+        { enabled: true },
+      );
+      expect(reenableDocx.status).toBe(200);
+      expect(reenableDocx.data.skill.enabled).toBe(true);
+
+      // 5. Custom skill collision across canonical and legacy paths is detected & preserved
+      writeSkillDir(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills'), 'xlsx', {
+        name: 'Alice Custom XLSX',
+        description: 'Custom xlsx skill',
+        instructions: 'Custom xlsx instructions',
+      });
+      writeSkillDir(path.join(aliceProfile.profileDir, '.gemini', 'antigravity', 'skills'), 'pdf', {
+        name: 'Alice Legacy PDF',
+        description: 'Legacy antigravity pdf skill',
+        instructions: 'Legacy pdf instructions',
+      });
+      writeSkillDir(path.join(aliceProfile.profileDir, '.gemini', 'skills'), 'pptx', {
+        name: 'Alice Legacy PPTX',
+        description: 'Legacy skills pptx skill',
+        instructions: 'Legacy pptx instructions',
+      });
+
+      const aliceListCollision = await alice.client.request<ApiSkillsList>('GET', '/api/skills');
+
+      const aliceXlsx = aliceListCollision.data.global.find((i) => i.slug === 'xlsx');
+      expect(aliceXlsx?.origin).toBe('custom');
+      expect(aliceXlsx?.hasBuiltinConflict).toBe(true);
+      expect(aliceXlsx?.storageKind).toBe('canonical');
+
+      const alicePdf = aliceListCollision.data.global.find((i) => i.slug === 'pdf');
+      expect(alicePdf?.origin).toBe('custom');
+      expect(alicePdf?.hasBuiltinConflict).toBe(true);
+      expect(alicePdf?.storageKind).toBe('legacy');
+
+      const alicePptx = aliceListCollision.data.global.find((i) => i.slug === 'pptx');
+      expect(alicePptx?.origin).toBe('custom');
+      expect(alicePptx?.hasBuiltinConflict).toBe(true);
+      expect(alicePptx?.storageKind).toBe('legacy');
+
+      // Alice can still edit and delete her colliding Custom skill
+      const editCustomXlsx = await alice.client.request<{
+        skill: { origin?: string; hasBuiltinConflict?: boolean; instructions: string };
+      }>('PUT', '/api/skills/global/xlsx', {
+        description: 'Updated custom xlsx',
+        instructions: 'Updated custom xlsx body',
+      });
+      expect(editCustomXlsx.status).toBe(200);
+      expect(editCustomXlsx.data.skill.origin).toBe('custom');
+      expect(editCustomXlsx.data.skill.hasBuiltinConflict).toBe(true);
+      expect(editCustomXlsx.data.skill.instructions).toContain('Updated custom xlsx body');
+
+      // Bob is completely unaffected by Alice's colliding skills
+      const bobList = await bob.client.request<ApiSkillsList>('GET', '/api/skills');
+      const bobXlsx = bobList.data.global.find((i) => i.slug === 'xlsx');
+      expect(bobXlsx?.origin).toBe('builtin');
+      expect(Boolean(bobXlsx?.hasBuiltinConflict)).toBe(false);
+
+      // Deleting Alice's colliding Custom xlsx immediately reveals Built-in xlsx
+      const deleteCustomXlsx = await alice.client.request('DELETE', '/api/skills/global/xlsx');
+      expect(deleteCustomXlsx.status).toBe(200);
+
+      const aliceAfterDelete = await alice.client.request<ApiSkillsList>('GET', '/api/skills');
+      const restoredBuiltinXlsx = aliceAfterDelete.data.global.find((i) => i.slug === 'xlsx');
+      expect(restoredBuiltinXlsx?.origin).toBe('builtin');
+      expect(Boolean(restoredBuiltinXlsx?.hasBuiltinConflict)).toBe(false);
+
+      // 6. Regular custom skills remain editable and deletable
+      const createCustom = await alice.client.request<{ skill: { slug: string; origin?: string } }>(
+        'POST',
+        '/api/skills',
+        {
+          scope: 'global',
+          slug: 'my-team-notes',
+          description: 'Custom non-conflicting skill',
+          instructions: 'Custom notes',
+        },
+      );
+      expect(createCustom.status).toBe(201);
+      expect(createCustom.data.skill.origin).toBe('custom');
+      expect((await alice.client.request('DELETE', '/api/skills/global/my-team-notes')).status).toBe(200);
+    } finally {
+      await srv.cleanup();
+      fs.rmSync(builtinRoot, { recursive: true, force: true });
+    }
   });
 
-  it('apply-bundle.sh deploys builtin-skills atomically even in --runtime-only mode', () => {
+  test('Legacy .agy-builtin-skill migration and read-only Built-in link resolution', async () => {
+    const builtinRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-builtin-migrate-'));
+    const builtinSkillsDir = seedBuiltinCatalog(builtinRoot, 'v1');
+    const srv = await createTestServer({ builtinSkillsDir });
+
+    try {
+      const alice = await registerAndBindAgy(srv.baseUrl, 'alice_migrate', 'alice-mig');
+      const aliceProfile = srv.ctx.db.getAgyProfile(alice.userId)!;
+
+      // Seed old copied built-in artifacts inside profileDir
+      writeSkillDir(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills-disabled'), 'docx', {
+        legacyMarker: true,
+      });
+      writeSkillDir(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills'), 'pptx', {
+        legacyMarker: true,
+      });
+      // Also place a Custom skill named xlsx WITHOUT the legacy marker (must NOT be removed)
+      writeSkillDir(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills'), 'xlsx', {
+        legacyMarker: false,
+      });
+
+      migrateLegacySyncedBuiltins(aliceProfile.profileDir, builtinSkillsDir);
+
+      expect(
+        fs.existsSync(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills-disabled', 'docx')),
+      ).toBe(false);
+      expect(
+        fs.existsSync(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills', 'pptx')),
+      ).toBe(false);
+      expect(
+        fs.existsSync(path.join(aliceProfile.profileDir, '.gemini', 'config', 'skills', 'xlsx', 'SKILL.md')),
+      ).toBe(true);
+
+      const disabledSet = readProfileDisabledBuiltins(aliceProfile.profileDir);
+      const customSlugs = listCustomGlobalSkillSlugs(aliceProfile.profileDir);
+      const resolvedState = resolveActiveBuiltinSkillsForProfile(aliceProfile.profileDir, builtinSkillsDir);
+      expect(disabledSet.has('docx')).toBe(true);
+      expect(customSlugs.has('xlsx')).toBe(true);
+      expect(resolvedState.conflicts).toEqual(['xlsx']);
+      expect(resolvedState.active.map((entry) => entry.slug).sort()).toEqual(['pdf', 'pptx']);
+
+      // Chat file link resolution resolves active Built-in files read-only (but not disabled/custom-shadowed ones)
+      const projRes = await alice.client.request<{ project: { id: string } }>('POST', '/api/projects', {
+        name: 'Link Proj',
+      });
+      const chatRes = await alice.client.request<{ chat: { id: string } }>('POST', '/api/chats', {
+        title: 'Link Chat',
+        projectId: projRes.data.project.id,
+      });
+
+      const activeBuiltinLink = resolveAuthorizedChatFileReference({
+        db: srv.ctx.db,
+        userId: alice.userId,
+        chatId: chatRes.data.chat.id,
+        reference: `${SANDBOX_HOME_MOUNT}/.gemini/config/skills/pptx/SKILL.md`,
+        builtinSkillsDir,
+      });
+      expect(activeBuiltinLink).toBeTruthy();
+
+      const disabledBuiltinLink = resolveAuthorizedChatFileReference({
+        db: srv.ctx.db,
+        userId: alice.userId,
+        chatId: chatRes.data.chat.id,
+        reference: `${SANDBOX_HOME_MOUNT}/.gemini/config/skills/docx/scripts/render.py`,
+        builtinSkillsDir,
+      });
+      expect(disabledBuiltinLink).toBeNull();
+    } finally {
+      await srv.cleanup();
+      fs.rmSync(builtinRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('Sandbox bwrap mounts active Built-in skills read-only, Custom skills read-write, and shared doc-runtime read-only', () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-bwrap-mount-'));
+    try {
+      const builtinSkillsDir = seedBuiltinCatalog(tmpRoot, 'v1');
+      const docRuntimeDir = path.join(tmpRoot, 'doc-runtime');
+      fs.mkdirSync(path.join(docRuntimeDir, 'venv', 'bin'), { recursive: true });
+      fs.mkdirSync(path.join(docRuntimeDir, 'venv', 'lib', 'python3.11', 'site-packages'), { recursive: true });
+      fs.mkdirSync(path.join(docRuntimeDir, 'node', 'node_modules', '.bin'), { recursive: true });
+      fs.writeFileSync(path.join(docRuntimeDir, 'venv', 'bin', 'python3'), '#!/bin/sh\n', { mode: 0o755 });
+      fs.writeFileSync(path.join(docRuntimeDir, 'manifest.json'), JSON.stringify({ version: 1 }), 'utf8');
+
+      const profileDir = path.join(tmpRoot, 'profile');
+      const workspaceDir = path.join(tmpRoot, 'workspace-1');
+      fs.mkdirSync(path.join(profileDir, '.gemini', 'config'), { recursive: true });
+      fs.mkdirSync(workspaceDir, { recursive: true });
+
+      // Disable pdf; collide xlsx with a Custom skill; add my-custom skill
+      fs.writeFileSync(
+        path.join(profileDir, '.gemini', 'config', BUILTIN_STATE_FILENAME),
+        JSON.stringify({ disabled: ['pdf'] }),
+        'utf8',
+      );
+      writeSkillDir(path.join(profileDir, '.gemini', 'config', 'skills'), 'my-custom');
+      writeSkillDir(path.join(profileDir, '.gemini', 'config', 'skills'), 'xlsx', {
+        name: 'User Custom XLSX',
+      });
+
+      const mockBinDir = path.join(tmpRoot, 'bin');
+      fs.mkdirSync(mockBinDir, { recursive: true });
+      const fakeBwrap = path.join(mockBinDir, 'bwrap');
+      const fakeAgy = path.join(mockBinDir, 'agy');
+      fs.writeFileSync(fakeBwrap, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      fs.writeFileSync(fakeAgy, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+      const chatHome = ensurePerChatHomeDir(profileDir, workspaceDir, builtinSkillsDir);
+      expect(fs.readlinkSync(path.join(chatHome, '.gemini', 'config', 'skills', 'docx'))).toBe(
+        path.join(builtinSkillsDir, 'docx'),
+      );
+      expect(fs.readlinkSync(path.join(chatHome, '.gemini', 'config', 'skills', 'my-custom'))).toBe(
+        path.join(profileDir, '.gemini', 'config', 'skills', 'my-custom'),
+      );
+      expect(fs.existsSync(path.join(chatHome, '.gemini', 'config', 'skills', 'pdf'))).toBe(false);
+
+      const cfg: AppConfig = {
+        nodeEnv: 'test',
+        host: '127.0.0.1',
+        port: 0,
+        dataRoot: tmpRoot,
+        sessionSecret: 'test-secret',
+        agyMode: 'cli',
+        agyBin: fakeAgy,
+        mockAgentPath: '',
+        builtinSkillsDir,
+        docRuntimeDir,
+        maxConcurrentAcp: 2,
+        maxAcpPerUser: 1,
+        idleWorkerMs: 60_000,
+        allowPublicSignup: true,
+        secureCookies: 'never',
+        sandboxMode: 'bwrap',
+        bwrapBin: fakeBwrap,
+        libreOfficeBin: null,
+        artifactsCacheRoot: path.join(tmpRoot, 'cache'),
+      };
+
+      const spec = buildAgyCommandSpec({
+        config: cfg,
+        subcommandArgs: ['acp'],
+        profileDir,
+        workspaceDir,
+        enableSandboxBwrap: true,
+      });
+
+      expect(spec.sandboxed).toBe(true);
+      const argsStr = spec.args.join('\n');
+      expect(argsStr).toContain(`--tmpfs\n${SANDBOX_HOME_MOUNT}/.gemini/config/skills`);
+      expect(argsStr).toContain(
+        `--bind\n${fs.realpathSync(path.join(profileDir, '.gemini', 'config', 'skills', 'my-custom'))}\n${SANDBOX_HOME_MOUNT}/.gemini/config/skills/my-custom`,
+      );
+      expect(argsStr).toContain(
+        `--ro-bind\n${fs.realpathSync(path.join(builtinSkillsDir, 'docx'))}\n${SANDBOX_HOME_MOUNT}/.gemini/config/skills/docx`,
+      );
+      expect(argsStr).not.toContain(`${SANDBOX_HOME_MOUNT}/.gemini/config/skills/pdf`);
+      expect(argsStr).not.toContain(`--ro-bind\n${fs.realpathSync(path.join(builtinSkillsDir, 'xlsx'))}`);
+      expect(argsStr).toContain(`--ro-bind\n${fs.realpathSync(docRuntimeDir)}\n${SANDBOX_DOC_RUNTIME_MOUNT}`);
+      expect(spec.env.NODE_PATH).toContain(`${SANDBOX_DOC_RUNTIME_MOUNT}/node/node_modules`);
+      expect(spec.env.PYTHONPATH).toContain(`${SANDBOX_DOC_RUNTIME_MOUNT}/venv/lib/python3.11/site-packages`);
+      expect(spec.env.PATH).toContain(`${SANDBOX_DOC_RUNTIME_MOUNT}/venv/bin`);
+      expect(spec.env.SAL_USE_VCLPLUGIN).toBe('svp');
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('Deploy scripts unify under INSTALL_DOC_RUNTIME=auto|0|1 and protect builtin-skills permissions', () => {
     const repoRoot = path.resolve(import.meta.dirname, '..', '..');
-    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-bundle-skills-test-'));
-    cleanups.push(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));
 
-    const appDir = path.join(tmpRoot, 'app');
-    const stageSrc = path.join(tmpRoot, 'stage-src');
-    const bundlePath = path.join(tmpRoot, 'bundle.tar.gz');
+    // Ensure legacy split flags are completely gone from deploy scripts & README
+    for (const rel of [
+      'deploy/setup-doc-runtime.sh',
+      'deploy/ubuntu-setup.sh',
+      'deploy/apply-bundle.sh',
+      'deploy/auto-update.sh',
+      'README.md',
+    ]) {
+      const content = fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+      expect(content).not.toContain('INSTALL_LIBREOFFICE');
+      expect(content).not.toContain('AUTO_SETUP_DOC_RUNTIME');
+    }
 
-    fs.mkdirSync(appDir, { recursive: true });
-    fs.mkdirSync(path.join(stageSrc, 'server', 'dist'), { recursive: true });
-    fs.mkdirSync(path.join(stageSrc, 'web', 'dist'), { recursive: true });
-    fs.mkdirSync(path.join(stageSrc, 'builtin-skills', 'pptx'), { recursive: true });
-    fs.writeFileSync(path.join(stageSrc, 'builtin-skills', 'pptx', 'SKILL.md'), '# pptx\n');
-    fs.writeFileSync(
-      path.join(stageSrc, 'builtin-skills', '.builtin-skills-manifest.json'),
-      JSON.stringify({ manifestDigest: 'abc', skills: { pptx: { sha256: 'def' } } })
-    );
-    fs.writeFileSync(path.join(stageSrc, 'BUILD_INFO.json'), JSON.stringify({ version: '1.2.0' }));
-    execFileSync('tar', ['-czf', bundlePath, '-C', stageSrc, '.']);
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-doc-runtime-script-'));
+    try {
+      const setupScript = path.join(repoRoot, 'deploy', 'setup-doc-runtime.sh');
+      const emptyEnvFile = path.join(tmpRoot, 'missing-env');
 
-    execFileSync(
-      'bash',
-      [path.join(repoRoot, 'deploy', 'apply-bundle.sh'), bundlePath, '--runtime-only', '--no-restart'],
-      {
+      // INSTALL_DOC_RUNTIME=0 always skips cleanly regardless of RAM
+      const skipExplicit = execFileSync('bash', [setupScript], {
+        env: { ...process.env, INSTALL_DOC_RUNTIME: '0', ENV_FILE: emptyEnvFile },
         encoding: 'utf8',
+      });
+      expect(skipExplicit).toMatch(/Skipping setup \(INSTALL_DOC_RUNTIME=0\)/);
+
+      // INSTALL_DOC_RUNTIME=auto skips on low-RAM host (<2.2GB)
+      const lowMeminfo = path.join(tmpRoot, 'meminfo-low');
+      fs.writeFileSync(lowMeminfo, 'MemTotal:        1500000 kB\n', 'utf8');
+      const skipAutoLow = execFileSync('bash', [setupScript], {
         env: {
           ...process.env,
-          APP_DIR: appDir,
-          AUTO_SETUP_DOC_RUNTIME: '0',
+          INSTALL_DOC_RUNTIME: 'auto',
+          ENV_FILE: emptyEnvFile,
+          MEMINFO_FILE: lowMeminfo,
         },
-      }
-    );
+        encoding: 'utf8',
+      });
+      expect(skipAutoLow).toMatch(/Skipping automatic setup on low-RAM host/);
 
-    expect(fs.existsSync(path.join(appDir, 'builtin-skills', 'pptx', 'SKILL.md'))).toBe(true);
-    expect(fs.existsSync(path.join(appDir, 'builtin-skills', '.builtin-skills-manifest.json'))).toBe(true);
+      // ENV_FILE (/etc/antigravity-chat/env equivalent) can disable setup consistently
+      const disabledEnvFile = path.join(tmpRoot, 'chat-env');
+      fs.writeFileSync(disabledEnvFile, 'INSTALL_DOC_RUNTIME=0\n', 'utf8');
+      const skipViaEnvFile = execFileSync('bash', [setupScript], {
+        env: { ...process.env, INSTALL_DOC_RUNTIME: 'auto', ENV_FILE: disabledEnvFile },
+        encoding: 'utf8',
+      });
+      expect(skipViaEnvFile).toMatch(/Skipping setup \(INSTALL_DOC_RUNTIME=0\)/);
+
+      // apply-bundle.sh preserves read-only go-w on builtin-skills and skips doc-runtime when INSTALL_DOC_RUNTIME=0
+      const appDir = path.join(tmpRoot, 'app');
+      const bundleSrc = path.join(tmpRoot, 'bundle-src');
+      const bundleTar = path.join(tmpRoot, 'antigravity-chat-bundle.tar.gz');
+      const binDir = path.join(tmpRoot, 'bin');
+      fs.mkdirSync(path.join(bundleSrc, 'server', 'dist'), { recursive: true });
+      fs.mkdirSync(path.join(bundleSrc, 'web', 'dist'), { recursive: true });
+      fs.mkdirSync(path.join(bundleSrc, 'builtin-skills', 'docx'), { recursive: true });
+      fs.mkdirSync(binDir, { recursive: true });
+      fs.writeFileSync(path.join(bundleSrc, 'package.json'), '{"name":"agy-chatui"}\n');
+      fs.writeFileSync(
+        path.join(bundleSrc, 'builtin-skills', 'docx', 'SKILL.md'),
+        '---\nname: docx\ndescription: x\n---\n',
+        { mode: 0o666 },
+      );
+      fs.writeFileSync(path.join(bundleSrc, 'setup-doc-runtime.sh'), fs.readFileSync(setupScript, 'utf8'), {
+        mode: 0o755,
+      });
+      execFileSync('tar', ['-czf', bundleTar, '-C', bundleSrc, '.']);
+
+      const fakeAgy = path.join(binDir, 'agy');
+      fs.writeFileSync(fakeAgy, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      const fakeSystemctl = path.join(binDir, 'systemctl');
+      fs.writeFileSync(fakeSystemctl, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      const unitFile = path.join(tmpRoot, 'antigravity-chat.service');
+      fs.writeFileSync(
+        unitFile,
+        `[Service]\nExecStart=/usr/bin/node ${appDir}/server/dist/index.js\n`,
+        'utf8',
+      );
+
+      const applyOut = execFileSync('bash', [path.join(repoRoot, 'deploy', 'apply-bundle.sh'), bundleTar], {
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH ?? '/usr/bin:/bin'}`,
+          APP_DIR: appDir,
+          SYSTEMD_UNIT_FILE: unitFile,
+          CANONICAL_AGY_BIN: fakeAgy,
+          DOC_RUNTIME_DIR: path.join(tmpRoot, 'doc-runtime'),
+          INSTALL_DOC_RUNTIME: '0',
+          ENV_FILE: emptyEnvFile,
+        },
+        encoding: 'utf8',
+      });
+      expect(applyOut).toMatch(/Bundle deployed cleanly/);
+      expect(fs.readFileSync(path.join(repoRoot, 'deploy', 'apply-bundle.sh'), 'utf8')).toContain(
+        'setup-doc-runtime.sh',
+      );
+      const skillMode = fs.statSync(path.join(appDir, 'builtin-skills', 'docx', 'SKILL.md')).mode & 0o777;
+      expect(skillMode & 0o022).toBe(0);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
   });
 });

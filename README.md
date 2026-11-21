@@ -35,8 +35,8 @@ Google の公式 CLI（[`agy`](https://antigravity.google)）を **無改変の�
 
 ## Oracle Cloud Always Free (Ubuntu) 推奨構成
 
-- **最推奨**: **`VM.Standard.A1.Flex` (Ampere ARM64, 最大 2 OCPU / 12 GB RAM — 月 1,500 OCPU時間・9,000 GB時間)** — 1台の **2 OCPU / 12 GB VM** に集約する構成が最適です。12 GB RAM は Node 24 サーバー・複数 `agy acp` ワーカー・`pdftoppm` に対して十分余裕がありますが、ローカルツール実行時は **2 コアの CPU がボトルネック** になりやすいため、ビルド作業を GitHub Actions 側に逃がしつつデフォルトを **`MAX_CONCURRENT_ACP=2`、`MAX_ACP_PER_USER=2`、`IDLE_WORKER_MS=600000`（10分）** に最適化し、2GB 以上のホストでは `INSTALL_DOC_RUNTIME=auto` / `INSTALL_LIBREOFFICE=auto` により隔離ドキュメントランタイム（`/opt/agy-doc-runtime`）と LibreOffice 変換環境も自動整備します（無効化する場合は `/etc/antigravity-chat/env` に `INSTALL_DOC_RUNTIME=0` または `INSTALL_LIBREOFFICE=0` を指定）。
-- **軽量単体向け**: **`VM.Standard.E2.1.Micro` (1/8 OCPU, 1 GB RAM)** — Actions 事前ビルドバンドル運用なら VM 上で `npm ci` / `vite build` を行わないため 1GB RAM でも更新負荷を抑えられます（2GB 未満のホストでは `INSTALL_DOC_RUNTIME=auto` は自動スキップされます。実行時は `MAX_CONCURRENT_ACP=1`、`MAX_ACP_PER_USER=1`、`IDLE_WORKER_MS=180000` 推奨）。
+- **最推奨**: **`VM.Standard.A1.Flex` (Ampere ARM64, 最大 2 OCPU / 12 GB RAM — 月 1,500 OCPU時間・9,000 GB時間)** — 1台の **2 OCPU / 12 GB VM** に集約する構成が最適です。12 GB RAM は Node 24 サーバー・複数 `agy acp` ワーカー・`pdftoppm` に対して十分余裕がありますが、ローカルツール実行時は **2 コアの CPU がボトルネック** になりやすいため、ビルド作業を GitHub Actions 側に逃がしつつデフォルトを **`MAX_CONCURRENT_ACP=2`、`MAX_ACP_PER_USER=2`、`IDLE_WORKER_MS=600000`（10分）** に最適化し、`INSTALL_DOC_RUNTIME=auto`（デフォルト）によりメモリ十分な環境では隔離ドキュメントランタイム（`/opt/agy-doc-runtime`・LibreOffice・フォント含む）を自動整備します（`/etc/antigravity-chat/env` で `INSTALL_DOC_RUNTIME=0` 指定時はスキップ、`=1` 指定時はメモリ量に関わらず強制導入）。
+- **軽量単体向け**: **`VM.Standard.E2.1.Micro` (1/8 OCPU, 1 GB RAM)** — Actions 事前ビルドバンドル運用なら VM 上で `npm ci` / `vite build` を行わないため 1GB RAM でも更新負荷を抑えられます（`INSTALL_DOC_RUNTIME=auto` では低メモリ環境として追加導入を自動スキップします。実行時は `MAX_CONCURRENT_ACP=1`、`MAX_ACP_PER_USER=1`、`IDLE_WORKER_MS=180000` 推奨）。
 - 詳しい運用ノート（Tailscale Serve による HTTPS 公開と Ubuntu `iptables` 回避、7日間アイドル回収ルール、コンシューマ版 `oauth-personal` 利用規約上の注意）は [docs/architecture.md](docs/architecture.md) を参照してください。
 
 ## セットアップ ＆ ビルド

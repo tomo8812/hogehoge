@@ -12,16 +12,22 @@ import type { SyncHub } from '../sync/hub.js';
 import type {
   AvailableCommandItem,
   SkillDetail,
+  SkillOrigin,
   SkillResourceFile,
   SkillScope,
   SkillSummary,
   SkillTemplate,
 } from '../types.js';
+import {
+  LEGACY_BUILTIN_SYNC_MARKER,
+  migrateLegacySyncedBuiltins,
+  readBuiltinSkillsCatalog,
+  readProfileDisabledBuiltins,
+  writeProfileDisabledBuiltins,
+} from './builtin-skills.js';
 
 const PROJECT_SYNC_MARKER = '.agy-project-skill';
-const BUILTIN_SYNC_MARKER = '.agy-builtin-skill';
-const BUILTIN_STATE_FILENAME = '.builtin-skills-state.json';
-const BUILTIN_MANIFEST_FILENAME = '.builtin-skills-manifest.json';
+const BUILTIN_SYNC_MARKER = LEGACY_BUILTIN_SYNC_MARKER;
 
 export class SkillValidationError extends Error {
   public readonly statusCode: number;
@@ -326,6 +332,7 @@ interface ResolvedScopeRoots {
   enabledDir: string;
   disabledDir: string;
   legacyEnabledDirs: string[];
+  profileDir: string | null;
   projectId: string | null;
   chatId: string | null;
 }
@@ -355,6 +362,7 @@ export class SkillService {
           path.join(profile.profileDir, '.gemini', 'skills'),
           path.join(profile.profileDir, '.gemini', 'antigravity', 'skills'),
         ],
+        profileDir: profile.profileDir,
         projectId: null,
         chatId: null,
       };
@@ -373,6 +381,7 @@ export class SkillService {
         enabledDir: path.join(projectRoot, 'skills'),
         disabledDir: path.join(projectRoot, 'skills-disabled'),
         legacyEnabledDirs: [],
+        profileDir: null,
         projectId: project.id,
         chatId: null,
       };
@@ -389,6 +398,7 @@ export class SkillService {
       enabledDir: path.join(chat.workspaceDir, '.agents', 'skills'),
       disabledDir: path.join(chat.workspaceDir, '.agents', 'skills-disabled'),
       legacyEnabledDirs: [path.join(chat.workspaceDir, '.agent', 'skills')],
+      profileDir: null,
       projectId: chat.projectId,
       chatId: chat.id,
     };
@@ -400,6 +410,12 @@ export class SkillService {
   }> {
     const items: Array<{ summary: SkillSummary; dir: string }> = [];
     const seen = new Set<string>();
+    const builtinCatalog =
+      scope === 'global' ? readBuiltinSkillsCatalog(this.config.builtinSkillsDir) : new Map();
+    const disabledBuiltins =
+      scope === 'global' && roots.profileDir
+        ? readProfileDisabledBuiltins(roots.profileDir)
+        : new Set<string>();
 
     const scanDir = (
       baseDir: string,
@@ -429,6 +445,10 @@ export class SkillService {
         if (scope === 'workspace' && fs.existsSync(path.join(skillDir, PROJECT_SYNC_MARKER))) {
           continue;
         }
+        // Ignore legacy built-in synced copies if any remain before migration
+        if (scope === 'global' && fs.existsSync(path.join(skillDir, BUILTIN_SYNC_MARKER))) {
+          continue;
+        }
 
         const skillMdPath = path.join(skillDir, 'SKILL.md');
         if (!fs.existsSync(skillMdPath)) continue;
@@ -446,6 +466,8 @@ export class SkillService {
               name: parsed.name || slug,
               description: parsed.description,
               scope,
+              origin: 'custom',
+              ...(scope === 'global' && builtinCatalog.has(slug) ? { hasBuiltinConflict: true } : {}),
               projectId: roots.projectId,
               chatId: roots.chatId,
               enabled,
@@ -467,6 +489,41 @@ export class SkillService {
     }
     scanDir(roots.disabledDir, false, 'canonical');
 
+    // Add Built-in skills that do not collide with any existing Custom skill (canonical or legacy)
+    if (scope === 'global' && builtinCatalog.size > 0) {
+      for (const [slug, builtin] of builtinCatalog.entries()) {
+        if (seen.has(slug)) continue;
+        const skillMdPath = path.join(builtin.dir, 'SKILL.md');
+        if (!fs.existsSync(skillMdPath)) continue;
+        try {
+          const stat = fs.statSync(skillMdPath);
+          const raw = fs.readFileSync(skillMdPath, 'utf8');
+          const parsed = parseSkillMarkdown(raw, slug);
+          const resources = listSkillResourceFiles(builtin.dir);
+          seen.add(slug);
+          items.push({
+            dir: builtin.dir,
+            summary: {
+              slug,
+              name: parsed.name || slug,
+              description: parsed.description,
+              scope: 'global',
+              origin: 'builtin',
+              projectId: null,
+              chatId: null,
+              enabled: !disabledBuiltins.has(slug),
+              disableModelInvocation: parsed.disableModelInvocation,
+              resourceCount: resources.length,
+              updatedAt: Math.floor(stat.mtimeMs),
+              storageKind: 'builtin',
+            },
+          });
+        } catch {
+          // ignore unreadable entry
+        }
+      }
+    }
+
     items.sort((a, b) => a.summary.slug.localeCompare(b.summary.slug));
     return items;
   }
@@ -480,26 +537,80 @@ export class SkillService {
     roots: ResolvedScopeRoots;
     skillDir: string;
     enabled: boolean;
-    storageKind: 'canonical' | 'legacy';
+    storageKind: 'canonical' | 'legacy' | 'builtin';
+    origin: SkillOrigin;
+    hasBuiltinConflict?: boolean;
   } {
     const slug = validateSkillSlug(params.slug);
     const roots = this.resolveScopeRoots(userId, params.scope, params.projectId, params.chatId);
+    const builtinCatalog =
+      params.scope === 'global' ? readBuiltinSkillsCatalog(this.config.builtinSkillsDir) : new Map();
+    const conflictFlag = params.scope === 'global' && builtinCatalog.has(slug) ? true : undefined;
 
     const canonicalEnabled = path.join(roots.enabledDir, slug);
-    if (fs.existsSync(path.join(canonicalEnabled, 'SKILL.md'))) {
-      return { scope: params.scope, slug, roots, skillDir: canonicalEnabled, enabled: true, storageKind: 'canonical' };
+    if (
+      fs.existsSync(path.join(canonicalEnabled, 'SKILL.md')) &&
+      !(params.scope === 'global' && fs.existsSync(path.join(canonicalEnabled, BUILTIN_SYNC_MARKER)))
+    ) {
+      return {
+        scope: params.scope,
+        slug,
+        roots,
+        skillDir: canonicalEnabled,
+        enabled: true,
+        storageKind: 'canonical',
+        origin: 'custom',
+        ...(conflictFlag ? { hasBuiltinConflict: true } : {}),
+      };
     }
 
     for (const legacyDir of roots.legacyEnabledDirs) {
       const candidate = path.join(legacyDir, slug);
       if (fs.existsSync(path.join(candidate, 'SKILL.md'))) {
-        return { scope: params.scope, slug, roots, skillDir: candidate, enabled: true, storageKind: 'legacy' };
+        return {
+          scope: params.scope,
+          slug,
+          roots,
+          skillDir: candidate,
+          enabled: true,
+          storageKind: 'legacy',
+          origin: 'custom',
+          ...(conflictFlag ? { hasBuiltinConflict: true } : {}),
+        };
       }
     }
 
     const canonicalDisabled = path.join(roots.disabledDir, slug);
-    if (fs.existsSync(path.join(canonicalDisabled, 'SKILL.md'))) {
-      return { scope: params.scope, slug, roots, skillDir: canonicalDisabled, enabled: false, storageKind: 'canonical' };
+    if (
+      fs.existsSync(path.join(canonicalDisabled, 'SKILL.md')) &&
+      !(params.scope === 'global' && fs.existsSync(path.join(canonicalDisabled, BUILTIN_SYNC_MARKER)))
+    ) {
+      return {
+        scope: params.scope,
+        slug,
+        roots,
+        skillDir: canonicalDisabled,
+        enabled: false,
+        storageKind: 'canonical',
+        origin: 'custom',
+        ...(conflictFlag ? { hasBuiltinConflict: true } : {}),
+      };
+    }
+
+    if (params.scope === 'global' && builtinCatalog.has(slug)) {
+      const builtin = builtinCatalog.get(slug)!;
+      const disabledBuiltins = roots.profileDir
+        ? readProfileDisabledBuiltins(roots.profileDir)
+        : new Set<string>();
+      return {
+        scope: 'global',
+        slug,
+        roots,
+        skillDir: builtin.dir,
+        enabled: !disabledBuiltins.has(slug),
+        storageKind: 'builtin',
+        origin: 'builtin',
+      };
     }
 
     throw new SkillValidationError('SKILL_NOT_FOUND', `スキル "/${slug}" が見つかりません。`, 404);
@@ -511,7 +622,9 @@ export class SkillService {
     roots: ResolvedScopeRoots;
     skillDir: string;
     enabled: boolean;
-    storageKind: 'canonical' | 'legacy';
+    storageKind: 'canonical' | 'legacy' | 'builtin';
+    origin: SkillOrigin;
+    hasBuiltinConflict?: boolean;
   }): SkillDetail {
     const skillMdPath = path.join(params.skillDir, 'SKILL.md');
     const stat = fs.statSync(skillMdPath);
@@ -524,6 +637,8 @@ export class SkillService {
       name: parsed.name || params.slug,
       description: parsed.description,
       scope: params.scope,
+      origin: params.origin,
+      ...(params.hasBuiltinConflict ? { hasBuiltinConflict: true } : {}),
       projectId: params.roots.projectId,
       chatId: params.roots.chatId,
       enabled: params.enabled,
@@ -685,226 +800,8 @@ export class SkillService {
     return affectedChatIds;
   }
 
-  private readBuiltinManifest(): {
-    source: string;
-    manifestDigest: string;
-    skills: Record<string, { sha256: string }>;
-  } | null {
-    const baseDir = this.config.builtinSkillsDir;
-    if (!baseDir || !fs.existsSync(baseDir)) return null;
-    const manifestPath = path.join(baseDir, BUILTIN_MANIFEST_FILENAME);
-    if (!fs.existsSync(manifestPath)) return null;
-    try {
-      const parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as {
-        source?: unknown;
-        manifestDigest?: unknown;
-        skills?: Record<string, { sha256?: unknown }>;
-      };
-      if (!parsed || typeof parsed !== 'object' || !parsed.skills || typeof parsed.skills !== 'object') {
-        return null;
-      }
-      const skills: Record<string, { sha256: string }> = {};
-      for (const [slug, meta] of Object.entries(parsed.skills)) {
-        if (meta && typeof meta.sha256 === 'string' && meta.sha256) {
-          skills[slug] = { sha256: meta.sha256 };
-        }
-      }
-      if (Object.keys(skills).length === 0) return null;
-      return {
-        source: typeof parsed.source === 'string' && parsed.source ? parsed.source : 'anthropics/skills',
-        manifestDigest: typeof parsed.manifestDigest === 'string' ? parsed.manifestDigest : '',
-        skills,
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  private readProfileBuiltinState(configDir: string): {
-    manifestDigest: string;
-    skills: Record<string, { status: 'synced' | 'disabled' | 'customized' | 'deleted'; sha256?: string }>;
-  } {
-    const statePath = path.join(configDir, BUILTIN_STATE_FILENAME);
-    if (!fs.existsSync(statePath)) {
-      return { manifestDigest: '', skills: {} };
-    }
-    try {
-      const parsed = JSON.parse(fs.readFileSync(statePath, 'utf8')) as {
-        manifestDigest?: unknown;
-        skills?: Record<string, { status?: unknown; sha256?: unknown }>;
-      };
-      const skills: Record<string, { status: 'synced' | 'disabled' | 'customized' | 'deleted'; sha256?: string }> = {};
-      if (parsed && parsed.skills && typeof parsed.skills === 'object') {
-        for (const [k, v] of Object.entries(parsed.skills)) {
-          if (
-            v &&
-            (v.status === 'synced' || v.status === 'disabled' || v.status === 'customized' || v.status === 'deleted')
-          ) {
-            skills[k] = {
-              status: v.status,
-              ...(typeof v.sha256 === 'string' ? { sha256: v.sha256 } : {}),
-            };
-          }
-        }
-      }
-      return {
-        manifestDigest: typeof parsed?.manifestDigest === 'string' ? parsed.manifestDigest : '',
-        skills,
-      };
-    } catch {
-      return { manifestDigest: '', skills: {} };
-    }
-  }
-
-  private writeProfileBuiltinState(
-    configDir: string,
-    state: {
-      manifestDigest: string;
-      skills: Record<string, { status: 'synced' | 'disabled' | 'customized' | 'deleted'; sha256?: string }>;
-    }
-  ): void {
-    fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
-    const statePath = path.join(configDir, BUILTIN_STATE_FILENAME);
-    const tmpPath = `${statePath}.tmp.${process.pid}`;
-    fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
-    fs.renameSync(tmpPath, statePath);
-  }
-
-  private readBuiltinMarker(skillDir: string): { slug?: string; sha256?: string } | null {
-    const markerPath = path.join(skillDir, BUILTIN_SYNC_MARKER);
-    if (!fs.existsSync(markerPath)) return null;
-    try {
-      return JSON.parse(fs.readFileSync(markerPath, 'utf8')) as { slug?: string; sha256?: string };
-    } catch {
-      return {};
-    }
-  }
-
-  private markBuiltinSkillStateOnUserMutation(
-    roots: ResolvedScopeRoots,
-    slug: string,
-    skillDir: string | null,
-    status: 'synced' | 'disabled' | 'customized' | 'deleted'
-  ): void {
-    if (roots.projectId !== null || roots.chatId !== null) return;
-    const configDir = path.dirname(roots.enabledDir);
-    const state = this.readProfileBuiltinState(configDir);
-    const marker = skillDir ? this.readBuiltinMarker(skillDir) : null;
-    if (!marker && !state.skills[slug]) return;
-
-    if (status === 'customized' && skillDir) {
-      fs.rmSync(path.join(skillDir, BUILTIN_SYNC_MARKER), { force: true });
-    }
-    state.skills[slug] = {
-      status,
-      ...(marker?.sha256 && (status === 'synced' || status === 'disabled') ? { sha256: marker.sha256 } : {}),
-    };
-    this.writeProfileBuiltinState(configDir, state);
-  }
-
-  syncBuiltinSkillsToProfile(profileDir: string): { synced: string[]; skipped: string[] } {
-    const manifest = this.readBuiltinManifest();
-    if (!manifest) return { synced: [], skipped: [] };
-
-    const configDir = path.join(profileDir, '.gemini', 'config');
-    const enabledRoot = path.join(configDir, 'skills');
-    const disabledRoot = path.join(configDir, 'skills-disabled');
-    fs.mkdirSync(enabledRoot, { recursive: true, mode: 0o700 });
-
-    const state = this.readProfileBuiltinState(configDir);
-
-    // Fast path when current manifest is already synced and managed dirs remain intact
-    if (state.manifestDigest && state.manifestDigest === manifest.manifestDigest) {
-      const allPresent = Object.keys(manifest.skills).every((rawSlug) => {
-        const entry = state.skills[rawSlug];
-        if (!entry) return false;
-        if (entry.status === 'deleted' || entry.status === 'customized') return true;
-        if (entry.status === 'disabled') {
-          return fs.existsSync(path.join(disabledRoot, rawSlug, 'SKILL.md'));
-        }
-        return fs.existsSync(path.join(enabledRoot, rawSlug, 'SKILL.md'));
-      });
-      if (allPresent) {
-        return { synced: [], skipped: [] };
-      }
-    }
-
-    const synced: string[] = [];
-    const skipped: string[] = [];
-
-    for (const [rawSlug, info] of Object.entries(manifest.skills)) {
-      let slug: string;
-      try {
-        slug = validateSkillSlug(rawSlug);
-      } catch {
-        continue;
-      }
-
-      const srcSkillDir = path.join(this.config.builtinSkillsDir, slug);
-      if (!fs.existsSync(path.join(srcSkillDir, 'SKILL.md'))) continue;
-
-      const prevEntry = state.skills[slug];
-      if (prevEntry?.status === 'deleted' || prevEntry?.status === 'customized') {
-        skipped.push(slug);
-        continue;
-      }
-
-      const enabledSkillDir = path.join(enabledRoot, slug);
-      const disabledSkillDir = path.join(disabledRoot, slug);
-      const hasEnabled = fs.existsSync(path.join(enabledSkillDir, 'SKILL.md'));
-      const hasDisabled = fs.existsSync(path.join(disabledSkillDir, 'SKILL.md'));
-      const enabledMarker = hasEnabled ? this.readBuiltinMarker(enabledSkillDir) : null;
-      const disabledMarker = hasDisabled ? this.readBuiltinMarker(disabledSkillDir) : null;
-
-      // Preserve user-authored canonical skills with the same slug
-      if (hasEnabled && !enabledMarker) {
-        skipped.push(slug);
-        continue;
-      }
-      if (hasDisabled && !disabledMarker && prevEntry?.status !== 'disabled') {
-        skipped.push(slug);
-        continue;
-      }
-
-      const installToTarget = (targetDir: string) => {
-        const parentDir = path.dirname(targetDir);
-        fs.mkdirSync(parentDir, { recursive: true, mode: 0o700 });
-        const stageDir = path.join(parentDir, `.${slug}.builtin-tmp.${process.pid}`);
-        const oldDir = path.join(parentDir, `.${slug}.builtin-old.${process.pid}`);
-        fs.rmSync(stageDir, { recursive: true, force: true });
-        fs.rmSync(oldDir, { recursive: true, force: true });
-        copyDirectoryRecursive(srcSkillDir, stageDir);
-        fs.writeFileSync(
-          path.join(stageDir, BUILTIN_SYNC_MARKER),
-          JSON.stringify({ slug, sha256: info.sha256, source: manifest.source, syncedAt: Date.now() }) + '\n',
-          { mode: 0o600 }
-        );
-        if (fs.existsSync(targetDir)) {
-          fs.renameSync(targetDir, oldDir);
-        }
-        fs.renameSync(stageDir, targetDir);
-        fs.rmSync(oldDir, { recursive: true, force: true });
-      };
-
-      if (hasDisabled && (disabledMarker || prevEntry?.status === 'disabled')) {
-        if (disabledMarker?.sha256 !== info.sha256) {
-          installToTarget(disabledSkillDir);
-          synced.push(slug);
-        }
-        state.skills[slug] = { status: 'disabled', sha256: info.sha256 };
-        continue;
-      }
-
-      if (!hasEnabled || enabledMarker?.sha256 !== info.sha256) {
-        installToTarget(enabledSkillDir);
-        synced.push(slug);
-      }
-      state.skills[slug] = { status: 'synced', sha256: info.sha256 };
-    }
-
-    state.manifestDigest = manifest.manifestDigest;
-    this.writeProfileBuiltinState(configDir, state);
-    return { synced, skipped };
+  syncBuiltinSkillsToProfile(profileDir: string): void {
+    migrateLegacySyncedBuiltins(profileDir);
   }
 
   syncBuiltinSkillsToAllProfiles(): void {
@@ -931,17 +828,39 @@ export class SkillService {
   ): { detail: SkillDetail; affectedProjectChatIds: string[] } {
     const slug = validateSkillSlug(input.slug);
     const roots = this.resolveScopeRoots(userId, input.scope, input.projectId, input.chatId);
+    const builtinCatalog =
+      input.scope === 'global' ? readBuiltinSkillsCatalog(this.config.builtinSkillsDir) : new Map();
+
+    const isCustomDir = (dirPath: string): boolean =>
+      fs.existsSync(path.join(dirPath, 'SKILL.md')) &&
+      !(input.scope === 'global' && fs.existsSync(path.join(dirPath, BUILTIN_SYNC_MARKER)));
 
     const enabledDir = path.join(roots.enabledDir, slug);
     const disabledDir = path.join(roots.disabledDir, slug);
-    const existsEnabled = fs.existsSync(path.join(enabledDir, 'SKILL.md'));
-    const existsDisabled = fs.existsSync(path.join(disabledDir, 'SKILL.md'));
+    const existsEnabled = isCustomDir(enabledDir);
+    const existsDisabled = isCustomDir(disabledDir);
     const existingLegacyDir =
       roots.legacyEnabledDirs
         .map((d) => path.join(d, slug))
         .find((d) => fs.existsSync(path.join(d, 'SKILL.md'))) ?? null;
+    const hasExistingCustom = existsEnabled || existsDisabled || Boolean(existingLegacyDir);
 
-    if (input.createOnly && (existsEnabled || existsDisabled || existingLegacyDir)) {
+    if (input.scope === 'global' && !hasExistingCustom && builtinCatalog.has(slug)) {
+      if (input.createOnly) {
+        throw new SkillValidationError(
+          'BUILTIN_SKILL_CONFLICT',
+          `Built-in スキル "/${slug}" と同名のグローバルスキルは作成・差し替えできません。`,
+          409
+        );
+      }
+      throw new SkillValidationError(
+        'BUILTIN_SKILL_READONLY',
+        `Built-in スキル "/${slug}" は編集・差し替えできません。`,
+        403
+      );
+    }
+
+    if (input.createOnly && hasExistingCustom) {
       throw new SkillValidationError('SKILL_EXISTS', `スキル "/${slug}" は既に存在します。`, 409);
     }
 
@@ -994,9 +913,6 @@ export class SkillService {
 
     const skillMdTarget = resolveContainedWriteTarget(targetDir, 'SKILL.md');
     fs.writeFileSync(skillMdTarget.absPath, finalSkillMd, 'utf8');
-    if (input.scope === 'global') {
-      this.markBuiltinSkillStateOnUserMutation(roots, slug, targetDir, 'customized');
-    }
 
     const affectedProjectChatIds =
       input.scope === 'project' && roots.projectId
@@ -1010,6 +926,8 @@ export class SkillService {
       skillDir: targetDir,
       enabled: wantEnabled,
       storageKind: 'canonical',
+      origin: 'custom',
+      hasBuiltinConflict: input.scope === 'global' && builtinCatalog.has(slug),
     });
 
     this.hub.emitDurable({
@@ -1028,6 +946,46 @@ export class SkillService {
     params: { scope: SkillScope; slug: string; projectId?: string | null; chatId?: string | null; enabled: boolean }
   ): { detail: SkillDetail; affectedProjectChatIds: string[] } {
     const found = this.findSkillDir(userId, params);
+
+    if (found.origin === 'builtin') {
+      if (!found.roots.profileDir) {
+        throw new SkillValidationError('PROFILE_NOT_FOUND', 'Antigravityプロファイルが見つかりません。', 404);
+      }
+      const disabledSet = readProfileDisabledBuiltins(found.roots.profileDir);
+      if (params.enabled) {
+        disabledSet.delete(found.slug);
+      } else {
+        disabledSet.add(found.slug);
+      }
+      writeProfileDisabledBuiltins(found.roots.profileDir, disabledSet);
+
+      const detail = this.buildDetailFromDir({
+        scope: params.scope,
+        slug: found.slug,
+        roots: found.roots,
+        skillDir: found.skillDir,
+        enabled: params.enabled,
+        storageKind: 'builtin',
+        origin: 'builtin',
+      });
+
+      this.hub.emitDurable({
+        userId,
+        type: 'skills.updated',
+        projectId: null,
+        chatId: null,
+        payload: {
+          scope: params.scope,
+          slug: found.slug,
+          enabled: params.enabled,
+          projectId: null,
+          chatId: null,
+        },
+      });
+
+      return { detail, affectedProjectChatIds: [] };
+    }
+
     const dstDir = params.enabled
       ? path.join(found.roots.enabledDir, found.slug)
       : path.join(found.roots.disabledDir, found.slug);
@@ -1038,15 +996,6 @@ export class SkillService {
         fs.rmSync(dstDir, { recursive: true, force: true });
       }
       fs.renameSync(found.skillDir, dstDir);
-    }
-
-    if (params.scope === 'global') {
-      this.markBuiltinSkillStateOnUserMutation(
-        found.roots,
-        found.slug,
-        dstDir,
-        params.enabled ? 'synced' : 'disabled'
-      );
     }
 
     const affectedProjectChatIds =
@@ -1061,6 +1010,8 @@ export class SkillService {
       skillDir: dstDir,
       enabled: params.enabled,
       storageKind: 'canonical',
+      origin: 'custom',
+      hasBuiltinConflict: found.hasBuiltinConflict,
     });
 
     this.hub.emitDurable({
@@ -1085,8 +1036,12 @@ export class SkillService {
     params: { scope: SkillScope; slug: string; projectId?: string | null; chatId?: string | null }
   ): { affectedProjectChatIds: string[] } {
     const found = this.findSkillDir(userId, params);
-    if (params.scope === 'global') {
-      this.markBuiltinSkillStateOnUserMutation(found.roots, found.slug, found.skillDir, 'deleted');
+    if (found.origin === 'builtin') {
+      throw new SkillValidationError(
+        'BUILTIN_SKILL_READONLY',
+        `Built-in スキル "/${found.slug}" は削除できません。無効化をご利用ください。`,
+        403
+      );
     }
     fs.rmSync(found.skillDir, { recursive: true, force: true });
 
@@ -1124,6 +1079,13 @@ export class SkillService {
     }
   ): { detail: SkillDetail; affectedProjectChatIds: string[] } {
     const found = this.findSkillDir(userId, params);
+    if (found.origin === 'builtin') {
+      throw new SkillValidationError(
+        'BUILTIN_SKILL_READONLY',
+        `Built-in スキル "/${found.slug}" の付属ファイルは編集・差し替えできません。`,
+        403
+      );
+    }
     let target: { absPath: string; relPath: string };
     try {
       target = resolveContainedWriteTarget(found.skillDir, params.relPath);
@@ -1146,9 +1108,6 @@ export class SkillService {
       } catch {
         // ignore chmod errors
       }
-    }
-    if (params.scope === 'global') {
-      this.markBuiltinSkillStateOnUserMutation(found.roots, found.slug, found.skillDir, 'customized');
     }
 
     const affectedProjectChatIds =
@@ -1181,6 +1140,13 @@ export class SkillService {
     params: { scope: SkillScope; slug: string; projectId?: string | null; chatId?: string | null; relPath: string }
   ): { detail: SkillDetail; affectedProjectChatIds: string[] } {
     const found = this.findSkillDir(userId, params);
+    if (found.origin === 'builtin') {
+      throw new SkillValidationError(
+        'BUILTIN_SKILL_READONLY',
+        `Built-in スキル "/${found.slug}" の付属ファイルは削除できません。`,
+        403
+      );
+    }
     const resolved = resolveContainedExistingPath(found.skillDir, params.relPath);
     if (
       resolved.relPath === 'SKILL.md' ||
@@ -1190,9 +1156,6 @@ export class SkillService {
       throw new SkillValidationError('CANNOT_DELETE_SKILL_MD', 'SKILL.md 自体はスキル削除から削除してください。');
     }
     fs.rmSync(resolved.absPath, { force: true });
-    if (params.scope === 'global') {
-      this.markBuiltinSkillStateOnUserMutation(found.roots, found.slug, found.skillDir, 'customized');
-    }
 
     const affectedProjectChatIds =
       params.scope === 'project' && found.roots.projectId

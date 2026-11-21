@@ -1728,6 +1728,7 @@ export class AcpClientManager {
       reference,
       label,
       mimeType,
+      builtinSkillsDir: this.config.builtinSkillsDir,
     });
     if (!resolved) return false;
     const { artifact } = resolved;

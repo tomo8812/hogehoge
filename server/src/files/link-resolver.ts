@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import mime from 'mime-types';
 import { getChatBrainHostDir, SANDBOX_HOME_MOUNT, SANDBOX_WORKSPACE_MOUNT } from '../acp/env-isolation.js';
 import type { AppDatabase } from '../db/database.js';
+import { resolveActiveBuiltinSkillsForProfile } from '../skills/builtin-skills.js';
 import type { ArtifactRecord, ChatRecord } from '../types.js';
 import { detectMimeAndPreviewKind, normalizeRelPath, resolveContainedExistingPath, sha256File } from './workspace.js';
 
@@ -118,7 +119,12 @@ function workspaceRelativePath(candidate: string): string {
 }
 
 /** Map native paths to this chat's private roots or non-sensitive user profile files without moving them. */
-function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): ResolvedChatFile | null {
+function resolveChatFile(
+  db: AppDatabase,
+  chat: ChatRecord,
+  candidate: string,
+  builtinSkillsDir?: string | null,
+): ResolvedChatFile | null {
   try {
     const resolved = resolveContainedExistingPath(chat.workspaceDir, workspaceRelativePath(candidate));
     if (fs.statSync(resolved.absPath).isFile()) return resolved;
@@ -237,23 +243,50 @@ function resolveChatFile(db: AppDatabase, chat: ChatRecord, candidate: string): 
     }
   }
 
+  const resolveFromBuiltinSkills = (): ResolvedChatFile | null => {
+    if (!builtinSkillsDir) return null;
+    const match = /^\.gemini\/config\/skills\/([^/]+)\/(.+)$/.exec(relative);
+    if (!match) return null;
+    const [, skillSlug, subPath] = match;
+    const { active: activeBuiltins } = resolveActiveBuiltinSkillsForProfile(home, builtinSkillsDir);
+    const active = activeBuiltins.find((entry) => entry.slug === skillSlug);
+    if (!active) return null;
+    try {
+      const resolved = resolveContainedExistingPath(active.dir, subPath);
+      const canonicalRel = `.gemini/config/skills/${skillSlug}/${resolved.relPath}`;
+      if (!isAllowedProfileRelPath(canonicalRel)) return null;
+      if (!fs.statSync(resolved.absPath).isFile()) return null;
+      return {
+        absPath: resolved.absPath,
+        relPath: `${SANDBOX_HOME_MOUNT}/${canonicalRel}`,
+      };
+    } catch {
+      return null;
+    }
+  };
+
   if (candidate.startsWith('~/')) {
-    return resolveFromChatHome() ?? resolveFromHome();
+    return resolveFromChatHome() ?? resolveFromHome() ?? resolveFromBuiltinSkills();
   }
 
   const inHome = resolveFromHome();
   if (inHome) return inHome;
 
   if (homePrefix === SANDBOX_HOME_MOUNT) {
-    return resolveFromChatHome();
+    return resolveFromChatHome() ?? resolveFromBuiltinSkills();
   }
 
   return null;
 }
 
 /** Resolve a stored artifact for every file endpoint, using the same chat boundary as link resolution. */
-export function resolveArtifactFile(db: AppDatabase, chat: ChatRecord, artifact: Pick<ArtifactRecord, 'relPath'>): ResolvedChatFile | null {
-  return resolveChatFile(db, chat, artifact.relPath);
+export function resolveArtifactFile(
+  db: AppDatabase,
+  chat: ChatRecord,
+  artifact: Pick<ArtifactRecord, 'relPath'>,
+  builtinSkillsDir?: string | null,
+): ResolvedChatFile | null {
+  return resolveChatFile(db, chat, artifact.relPath, builtinSkillsDir);
 }
 
 function buildArtifactUrls(artifact: ArtifactRecord): { previewUrl: string; downloadUrl: string } {
@@ -273,6 +306,7 @@ export function resolveAuthorizedChatFileReference(params: {
   mimeType?: string | null;
   messageId?: string;
   runId?: string;
+  builtinSkillsDir?: string | null;
 }): ResolvedWorkspaceLink | null {
   const { db, userId, chatId } = params;
   const chat = db.getChat(userId, chatId);
@@ -316,14 +350,14 @@ export function resolveAuthorizedChatFileReference(params: {
   };
 
   const byId = db.getArtifact(userId, candidate);
-  if (byId?.chatId === chatId) return register(resolveArtifactFile(db, chat, byId));
+  if (byId?.chatId === chatId) return register(resolveArtifactFile(db, chat, byId, params.builtinSkillsDir));
 
-  const exact = resolveChatFile(db, chat, candidate);
+  const exact = resolveChatFile(db, chat, candidate, params.builtinSkillsDir);
   if (exact) return register(exact);
 
   if (!/^file:\/\//i.test(params.reference.trim()) && /%[a-f0-9]{2}/i.test(candidate)) {
     try {
-      const decoded = resolveChatFile(db, chat, decodeURIComponent(candidate));
+      const decoded = resolveChatFile(db, chat, decodeURIComponent(candidate), params.builtinSkillsDir);
       if (decoded) return register(decoded);
     } catch {
       // A literal percent sign is valid in a raw path.

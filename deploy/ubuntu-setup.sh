@@ -9,7 +9,6 @@ APP_DIR="${APP_DIR:-/opt/antigravity-chat}"
 DATA_DIR="${DATA_DIR:-/var/lib/antigravity-chat}"
 DOC_RUNTIME_DIR="${DOC_RUNTIME_DIR:-/opt/agy-doc-runtime}"
 INSTALL_DOC_RUNTIME="${INSTALL_DOC_RUNTIME:-auto}"
-INSTALL_LIBREOFFICE="${INSTALL_LIBREOFFICE:-auto}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "==> [1/6] Installing base OS packages (python3, poppler-utils, bubblewrap, curl, ca-certificates)..."
@@ -64,7 +63,6 @@ fi
 if [[ -n "${SETUP_DOC_SCRIPT}" ]]; then
   DOC_RUNTIME_DIR="${DOC_RUNTIME_DIR}" \
   INSTALL_DOC_RUNTIME="${INSTALL_DOC_RUNTIME}" \
-  INSTALL_LIBREOFFICE="${INSTALL_LIBREOFFICE}" \
     bash "${SETUP_DOC_SCRIPT}"
 fi
 

@@ -55,6 +55,7 @@ export interface AvailableCommandItem {
 }
 
 export type SkillScope = 'global' | 'project' | 'workspace';
+export type SkillOrigin = 'builtin' | 'custom';
 
 export interface SkillResourceFile {
   relPath: string;
@@ -68,13 +69,15 @@ export interface SkillSummary {
   name: string;
   description: string;
   scope: SkillScope;
+  origin?: SkillOrigin;
+  hasBuiltinConflict?: boolean;
   projectId: string | null;
   chatId: string | null;
   enabled: boolean;
   disableModelInvocation: boolean;
   resourceCount: number;
   updatedAt: number;
-  storageKind?: 'canonical' | 'legacy';
+  storageKind?: 'canonical' | 'legacy' | 'builtin';
 }
 
 export interface SkillDetail extends SkillSummary {
