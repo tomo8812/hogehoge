@@ -664,6 +664,57 @@ function isSafeHttpUrl(raw: string | null | undefined): raw is string {
   }
 }
 
+const MAX_ELICITATION_PATTERN_LEN = 256;
+const MAX_ELICITATION_PATTERN_INPUT_LEN = 512;
+
+function isSafeElicitationPattern(pattern: string): boolean {
+  if (pattern.length === 0 || pattern.length > MAX_ELICITATION_PATTERN_LEN) return false;
+  if (/\\[1-9]/.test(pattern) || /\(\?[=!<]/.test(pattern)) return false;
+  let maxDepth = 0;
+  const stack: boolean[] = [];
+  for (let i = 0; i < pattern.length; i += 1) {
+    const ch = pattern[i];
+    if (ch === '\\') {
+      i += 1;
+      continue;
+    }
+    if (ch === '[') {
+      i += 1;
+      while (i < pattern.length) {
+        if (pattern[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (pattern[i] === ']') break;
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === '(') {
+      stack.push(false);
+      maxDepth = Math.max(maxDepth, stack.length);
+      if (maxDepth > 8) return false;
+      continue;
+    }
+    if (ch === ')') {
+      const hadInnerQuantOrAlt = stack.pop() ?? false;
+      const next = pattern[i + 1];
+      const hasOuterQuant = next === '+' || next === '*' || next === '?' || next === '{';
+      if (hadInnerQuantOrAlt && hasOuterQuant) {
+        return false;
+      }
+      if ((hadInnerQuantOrAlt || hasOuterQuant) && stack.length > 0) {
+        stack[stack.length - 1] = true;
+      }
+      continue;
+    }
+    if ((ch === '+' || ch === '*' || ch === '|' || ch === '{') && stack.length > 0) {
+      stack[stack.length - 1] = true;
+    }
+  }
+  return true;
+}
+
 const ElicitationCard: React.FC<{
   elicit: PendingElicitationRecord;
   clientId: string;
@@ -834,7 +885,11 @@ const ElicitationCard: React.FC<{
         setNotice(`「${label}」は${strProp.maxLength}文字以内で入力してください。`);
         return;
       }
-      if (typeof strProp.pattern === 'string' && strProp.pattern.length > 0) {
+      if (
+        typeof strProp.pattern === 'string' &&
+        text.length <= MAX_ELICITATION_PATTERN_INPUT_LEN &&
+        isSafeElicitationPattern(strProp.pattern)
+      ) {
         try {
           const patternRegex = new RegExp(strProp.pattern);
           if (!patternRegex.test(text)) {
