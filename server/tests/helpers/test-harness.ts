@@ -175,6 +175,8 @@ export async function createTestServer(
     port: 0,
     agyMode: 'mock',
     dataRoot,
+    builtinSkillsDir: path.join(dataRoot, '.empty-builtin-skills'),
+    docRuntimeDir: path.join(dataRoot, '.empty-doc-runtime'),
     maxConcurrentAcp: 4,
     maxAcpPerUser: 2,
     idleWorkerMs: 60_000,

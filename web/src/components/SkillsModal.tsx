@@ -227,8 +227,11 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
     }
   };
 
+  const isBuiltinReadOnly = editorMode === 'edit' && selectedDetail?.origin === 'builtin';
+
   const handleSaveSkill = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isBuiltinReadOnly) return;
     setError(null);
     setStatusNote(null);
 
@@ -616,6 +619,12 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                             >
                               <div className="skill-list-card-title">
                                 <span className="skill-slug-pill">/{item.slug}</span>
+                                <span className={`skill-tag ${item.origin === 'builtin' ? 'builtin' : 'custom'}`}>
+                                  {item.origin === 'builtin' ? 'Built-in' : 'Custom'}
+                                </span>
+                                {item.hasBuiltinConflict && (
+                                  <span className="skill-tag conflict">Built-in と同名</span>
+                                )}
                                 {item.storageKind === 'legacy' && (
                                   <span className="skill-tag legacy">legacy</span>
                                 )}
@@ -702,7 +711,21 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
               <form onSubmit={handleSaveSkill} className="stack-gap">
                 <div className="row-between">
                   <div className="row-actions">
-                    <strong>{editorMode === 'new' ? '新規スキル作成' : `編集: /${slug}`}</strong>
+                    <strong>
+                      {editorMode === 'new'
+                        ? '新規スキル作成'
+                        : isBuiltinReadOnly
+                          ? `Built-in: /${slug}`
+                          : `編集: /${slug}`}
+                    </strong>
+                    {editorMode === 'edit' && selectedDetail && (
+                      <span className={`skill-tag ${selectedDetail.origin === 'builtin' ? 'builtin' : 'custom'}`}>
+                        {selectedDetail.origin === 'builtin' ? 'Built-in' : 'Custom'}
+                      </span>
+                    )}
+                    {editorMode === 'edit' && selectedDetail?.hasBuiltinConflict && (
+                      <span className="skill-tag conflict">Built-in と同名</span>
+                    )}
                     {editorMode === 'edit' && enabled && onInsertSlashCommand && (
                       <button
                         type="button"
@@ -721,6 +744,10 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                       type="button"
                       className={`chip-btn ${rawMode ? 'active' : ''}`}
                       onClick={() => {
+                        if (isBuiltinReadOnly) {
+                          setRawMode((v) => !v);
+                          return;
+                        }
                         if (!rawMode) {
                           setRawSkillMd(
                             buildRawSkillMd({
@@ -744,10 +771,24 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                         }
                       }}
                     >
-                      {rawMode ? 'フォーム編集へ' : '直接編集'}
+                      {isBuiltinReadOnly
+                        ? (rawMode ? '詳細表示' : 'SKILL.md 原文')
+                        : (rawMode ? 'フォーム編集へ' : '直接編集')}
                     </button>
                   </div>
                 </div>
+
+                {isBuiltinReadOnly && (
+                  <div className="skill-readonly-notice" role="note">
+                    このスキルは Built-in（読み取り専用）です。内容・同梱ファイルの編集や削除はできませんが、有効 / 無効の切り替えと内容の閲覧は行えます。
+                  </div>
+                )}
+
+                {editorMode === 'edit' && selectedDetail?.hasBuiltinConflict && (
+                  <div className="skill-conflict-notice" role="note">
+                    同名の Built-in スキルが存在しますが、この Custom スキルが優先されています。この Custom スキルを削除すると Built-in スキルが再び利用できるようになります。
+                  </div>
+                )}
 
                 {editorMode === 'new' && (
                   <label className="field">
@@ -769,9 +810,10 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                       rows={13}
                       className="mono-textarea"
                       value={rawSkillMd}
-                      onChange={(e) => setRawSkillMd(e.target.value)}
+                      readOnly={isBuiltinReadOnly}
+                      onChange={isBuiltinReadOnly ? undefined : (e) => setRawSkillMd(e.target.value)}
                       placeholder={`---\nname: code-review\ndescription: いつ・何に使うかを記述（必須）\n---\n\n# 指示内容\nここに詳細な手順を書きます。`}
-                      required
+                      required={!isBuiltinReadOnly}
                     />
                   </label>
                 ) : (
@@ -781,7 +823,8 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                       <input
                         type="text"
                         value={name}
-                        onChange={(e) => setName(e.target.value)}
+                        readOnly={isBuiltinReadOnly}
+                        onChange={isBuiltinReadOnly ? undefined : (e) => setName(e.target.value)}
                         placeholder="例: コードレビュー"
                       />
                     </label>
@@ -791,9 +834,10 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                       <input
                         type="text"
                         value={description}
-                        onChange={(e) => setDescription(e.target.value)}
+                        readOnly={isBuiltinReadOnly}
+                        onChange={isBuiltinReadOnly ? undefined : (e) => setDescription(e.target.value)}
                         placeholder="例: コードやPRをレビューするときに使う"
-                        required
+                        required={!isBuiltinReadOnly}
                       />
                     </label>
 
@@ -802,42 +846,55 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                       <textarea
                         rows={8}
                         value={instructions}
-                        onChange={(e) => setInstructions(e.target.value)}
+                        readOnly={isBuiltinReadOnly}
+                        onChange={isBuiltinReadOnly ? undefined : (e) => setInstructions(e.target.value)}
                         placeholder="従わせたいルール・手順・出力形式などを記述してください。"
                       />
                     </label>
 
                     <ToggleSwitch
                       checked={disableModelInvocation}
+                      disabled={isBuiltinReadOnly || busy}
                       label="/コマンド指定時のみ実行（自動呼び出ししない）"
-                      onChange={setDisableModelInvocation}
+                      onChange={(next) => {
+                        if (!isBuiltinReadOnly) setDisableModelInvocation(next);
+                      }}
                     />
                   </>
                 )}
 
                 <ToggleSwitch
                   checked={enabled}
+                  disabled={busy}
                   label="このスキルを有効にする"
-                  onChange={setEnabled}
+                  onChange={(next) => {
+                    if (isBuiltinReadOnly && selectedDetail) {
+                      void handleToggleItem(selectedDetail, next);
+                    } else {
+                      setEnabled(next);
+                    }
+                  }}
                 />
 
-                <div className="row-between">
-                  <div>
-                    {editorMode === 'edit' && (
-                      <button
-                        type="button"
-                        className="btn btn-danger-outline btn-sm"
-                        disabled={busy}
-                        onClick={() => void handleDeleteSkill()}
-                      >
-                        <TrashIcon size={14} /> 削除
-                      </button>
-                    )}
+                {!isBuiltinReadOnly && (
+                  <div className="row-between">
+                    <div>
+                      {editorMode === 'edit' && (
+                        <button
+                          type="button"
+                          className="btn btn-danger-outline btn-sm"
+                          disabled={busy}
+                          onClick={() => void handleDeleteSkill()}
+                        >
+                          <TrashIcon size={14} /> 削除
+                        </button>
+                      )}
+                    </div>
+                    <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
+                      {busy ? '保存中...' : editorMode === 'new' ? 'スキルを作成' : '変更を保存'}
+                    </button>
                   </div>
-                  <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
-                    {busy ? '保存中...' : editorMode === 'new' ? 'スキルを作成' : '変更を保存'}
-                  </button>
-                </div>
+                )}
 
                 {editorMode === 'edit' && selectedDetail && (
                   <section className="settings-section" style={{ marginTop: 4 }}>
@@ -845,45 +902,47 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                       <div>
                         <h4>添付ファイル・資料</h4>
                       </div>
-                      <div className="row-actions">
-                        <select
-                          className="compact-select"
-                          value={uploadFolder}
-                          onChange={(e) => setUploadFolder(e.target.value as (typeof RESOURCE_FOLDERS)[number])}
-                        >
-                          {RESOURCE_FOLDERS.map((f) => (
-                            <option key={f} value={f}>{f}/</option>
-                          ))}
-                        </select>
-                        <button
-                          type="button"
-                          className="btn btn-secondary btn-xs"
-                          disabled={busy}
-                          onClick={() => resourceInputRef.current?.click()}
-                        >
-                          <PlusIcon size={13} /> ファイル添付
-                        </button>
-                        <button
-                          type="button"
-                          className="btn btn-secondary btn-xs"
-                          onClick={() => {
-                            setShowNewFileBox((v) => !v);
-                            if (!newFileRelPath) setNewFileRelPath(`${uploadFolder}/note.md`);
-                          }}
-                        >
-                          新規テキスト
-                        </button>
-                        <input
-                          ref={resourceInputRef}
-                          type="file"
-                          multiple
-                          hidden
-                          onChange={handleUploadResource}
-                        />
-                      </div>
+                      {!isBuiltinReadOnly && (
+                        <div className="row-actions">
+                          <select
+                            className="compact-select"
+                            value={uploadFolder}
+                            onChange={(e) => setUploadFolder(e.target.value as (typeof RESOURCE_FOLDERS)[number])}
+                          >
+                            {RESOURCE_FOLDERS.map((f) => (
+                              <option key={f} value={f}>{f}/</option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-xs"
+                            disabled={busy}
+                            onClick={() => resourceInputRef.current?.click()}
+                          >
+                            <PlusIcon size={13} /> ファイル添付
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-xs"
+                            onClick={() => {
+                              setShowNewFileBox((v) => !v);
+                              if (!newFileRelPath) setNewFileRelPath(`${uploadFolder}/note.md`);
+                            }}
+                          >
+                            新規テキスト
+                          </button>
+                          <input
+                            ref={resourceInputRef}
+                            type="file"
+                            multiple
+                            hidden
+                            onChange={handleUploadResource}
+                          />
+                        </div>
+                      )}
                     </div>
 
-                    {showNewFileBox && (
+                    {!isBuiltinReadOnly && showNewFileBox && (
                       <div className="skill-new-file-box">
                         <input
                           type="text"
@@ -933,14 +992,16 @@ export const SkillsModal: React.FC<SkillsModalProps> = ({
                               <span>{rf.relPath}</span>
                               <span className="muted-xs">({rf.sizeBytes} B)</span>
                             </button>
-                            <button
-                              type="button"
-                              className="icon-btn-sm danger"
-                              title="削除"
-                              onClick={() => void handleDeleteResource(rf.relPath)}
-                            >
-                              <TrashIcon size={13} />
-                            </button>
+                            {!isBuiltinReadOnly && (
+                              <button
+                                type="button"
+                                className="icon-btn-sm danger"
+                                title="削除"
+                                onClick={() => void handleDeleteResource(rf.relPath)}
+                              >
+                                <TrashIcon size={13} />
+                              </button>
+                            )}
                           </div>
                         ))}
                       </div>

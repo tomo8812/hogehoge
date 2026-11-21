@@ -162,11 +162,25 @@ export async function convertPresentationToPdfCached(params: {
     return expectedPdf;
   }
 
+  const loProfileDir = path.join(outDir, `.lo-profile-${process.pid}-${Date.now()}`);
+  fs.mkdirSync(loProfileDir, { recursive: true, mode: 0o700 });
   try {
     await execFileAsync(
       params.libreOfficeBin,
-      ['--headless', '--norestore', '--convert-to', 'pdf', '--outdir', outDir, params.sourceAbsPath],
-      { timeout: 30_000 }
+      [
+        `-env:UserInstallation=file://${loProfileDir}`,
+        '--headless',
+        '--norestore',
+        '--convert-to',
+        'pdf',
+        '--outdir',
+        outDir,
+        params.sourceAbsPath,
+      ],
+      {
+        timeout: 30_000,
+        env: { ...process.env, SAL_USE_VCLPLUGIN: 'svp' },
+      }
     );
     if (fs.existsSync(expectedPdf)) {
       return expectedPdf;
@@ -175,5 +189,7 @@ export async function convertPresentationToPdfCached(params: {
     return found ? path.join(outDir, found) : null;
   } catch {
     return null;
+  } finally {
+    fs.rmSync(loProfileDir, { recursive: true, force: true });
   }
 }

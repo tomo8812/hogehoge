@@ -61,6 +61,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
       userId: session.user.id,
       chatId,
       reference: body.data.reference,
+      builtinSkillsDir: config.builtinSkillsDir,
     });
     if (!resolved) {
       return reply.code(404).send({ error: 'LINK_NOT_FOUND', message: '対象ファイルが見つからないか権限がありません。' });
@@ -77,7 +78,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const chat = db.getChat(session.user.id, artifact.chatId);
     if (!chat) return reply.code(404).send({ error: 'NOT_FOUND' });
 
-    if (!resolveArtifactFile(db, chat, artifact)) {
+    if (!resolveArtifactFile(db, chat, artifact, config.builtinSkillsDir)) {
       return reply.code(404).send({ error: 'FILE_MISSING', message: '参照先のファイルが見つかりません。' });
     }
     return { artifact };
@@ -94,7 +95,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const chat = db.getChat(session.user.id, artifact.chatId);
     if (!chat) return reply.code(404).send({ error: 'NOT_FOUND' });
 
-    const file = resolveArtifactFile(db, chat, artifact);
+    const file = resolveArtifactFile(db, chat, artifact, config.builtinSkillsDir);
     if (!file) return reply.code(403).send({ error: 'FORBIDDEN' });
     let absPath = file.absPath;
 
@@ -201,7 +202,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const chat = db.getChat(session.user.id, artifact.chatId);
     if (!chat) return reply.code(404).send({ error: 'NOT_FOUND' });
 
-    const file = resolveArtifactFile(db, chat, artifact);
+    const file = resolveArtifactFile(db, chat, artifact, config.builtinSkillsDir);
     if (!file) return reply.code(404).send({ error: 'FILE_MISSING' });
     const { absPath } = file;
     const stat = await fs.promises.stat(absPath);
@@ -255,7 +256,7 @@ export async function registerFileRoutes(app: FastifyInstance, deps: RouteDeps):
     const project = db.getProject(session.user.id, parsed.data.projectId);
     if (!chat || !project) return reply.code(404).send({ error: 'PROJECT_NOT_FOUND' });
 
-    const fileSource = resolveArtifactFile(db, chat, artifact);
+    const fileSource = resolveArtifactFile(db, chat, artifact, config.builtinSkillsDir);
     if (!fileSource) return reply.code(404).send({ error: 'FILE_MISSING' });
     const { absPath: srcPath } = fileSource;
     const target = resolveContainedWriteTarget(project.storageDir, artifact.filename);

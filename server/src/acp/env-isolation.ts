@@ -4,12 +4,18 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { AppConfig } from '../config.js';
+import {
+  isValidSkillSlug,
+  LEGACY_BUILTIN_SYNC_MARKER,
+  resolveActiveBuiltinSkillsForProfile,
+} from '../skills/builtin-skills.js';
 import type { SandboxStatus } from '../types.js';
 
 const require = createRequire(import.meta.url);
 
 export const SANDBOX_WORKSPACE_MOUNT = '/workspace';
 export const SANDBOX_HOME_MOUNT = '/home/sandbox';
+export const SANDBOX_DOC_RUNTIME_MOUNT = '/opt/agy-doc-runtime';
 
 export function getChatBrainHostDir(profileDir: string, workspaceDir?: string | null): string {
   const profileAbs = path.resolve(profileDir);
@@ -56,6 +62,10 @@ const ETC_WHITELIST_DIRS = [
   '/etc/ld.so.conf.d',
   '/etc/alternatives',
   '/etc/terminfo',
+  '/etc/fonts',
+  '/etc/libreoffice',
+  '/etc/ImageMagick-6',
+  '/etc/ImageMagick-7',
 ] as const;
 
 const ETC_WHITELIST_FILES = [
@@ -477,7 +487,11 @@ export function prepareAgyUsageHome(profileDir: string, usageHome: string): void
   }
 }
 
-export function ensurePerChatHomeDir(profileDir: string, workspaceDir: string): string {
+export function ensurePerChatHomeDir(
+  profileDir: string,
+  workspaceDir: string,
+  builtinSkillsDir?: string | null
+): string {
   const profileAbs = path.resolve(profileDir);
   const workspaceAbs = path.resolve(workspaceDir);
   const wsKey = path.basename(workspaceAbs) || 'default';
@@ -501,13 +515,83 @@ export function ensurePerChatHomeDir(profileDir: string, workspaceDir: string): 
   const chatGemini = path.join(chatHomeDir, '.gemini');
   fs.mkdirSync(chatGemini, { recursive: true, mode: 0o700 });
 
+  const { active: activeBuiltins } = resolveActiveBuiltinSkillsForProfile(profileAbs, builtinSkillsDir);
   const isolatedVendorDirs = new Set(['antigravity', 'antigravity-cli', 'jetski']);
   const isolatedLeafDirs = new Set(['brain', 'scratch', 'playground']);
 
   if (fs.existsSync(profileGemini)) {
     for (const entry of fs.readdirSync(profileGemini, { withFileTypes: true })) {
       if (isolatedVendorDirs.has(entry.name) || isolatedLeafDirs.has(entry.name)) continue;
+      if (entry.name === 'config' && activeBuiltins.length > 0) continue;
       symlinkIfMissing(path.join(profileGemini, entry.name), path.join(chatGemini, entry.name));
+    }
+  }
+
+  const chatConfigDir = path.join(chatGemini, 'config');
+  const profileConfigDir = path.join(profileGemini, 'config');
+  if (activeBuiltins.length > 0) {
+    try {
+      if (fs.lstatSync(chatConfigDir).isSymbolicLink()) {
+        fs.rmSync(chatConfigDir, { force: true });
+      }
+    } catch {
+      // does not exist
+    }
+    fs.mkdirSync(chatConfigDir, { recursive: true, mode: 0o700 });
+    if (fs.existsSync(profileConfigDir)) {
+      for (const entry of fs.readdirSync(profileConfigDir, { withFileTypes: true })) {
+        if (entry.name === 'skills') continue;
+        symlinkIfMissing(path.join(profileConfigDir, entry.name), path.join(chatConfigDir, entry.name));
+      }
+    }
+
+    const chatSkillsDir = path.join(chatConfigDir, 'skills');
+    fs.mkdirSync(chatSkillsDir, { recursive: true, mode: 0o700 });
+    const desiredSkills = new Map<string, string>();
+    const profileSkillsDir = path.join(profileConfigDir, 'skills');
+    if (fs.existsSync(profileSkillsDir)) {
+      for (const entry of fs.readdirSync(profileSkillsDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+        if (!isValidSkillSlug(entry.name)) continue;
+        const candidate = path.join(profileSkillsDir, entry.name);
+        if (fs.existsSync(path.join(candidate, LEGACY_BUILTIN_SYNC_MARKER))) continue;
+        if (fs.existsSync(path.join(candidate, 'SKILL.md'))) {
+          desiredSkills.set(entry.name, candidate);
+        }
+      }
+    }
+    for (const builtin of activeBuiltins) {
+      if (!desiredSkills.has(builtin.slug)) {
+        desiredSkills.set(builtin.slug, builtin.dir);
+      }
+    }
+    for (const existing of fs.readdirSync(chatSkillsDir, { withFileTypes: true })) {
+      if (!desiredSkills.has(existing.name)) {
+        fs.rmSync(path.join(chatSkillsDir, existing.name), { recursive: true, force: true });
+      }
+    }
+    for (const [slug, targetDir] of desiredSkills.entries()) {
+      const linkPath = path.join(chatSkillsDir, slug);
+      try {
+        const st = fs.lstatSync(linkPath);
+        if (st.isSymbolicLink() && fs.readlinkSync(linkPath) === targetDir) continue;
+        fs.rmSync(linkPath, { recursive: true, force: true });
+      } catch {
+        // missing
+      }
+      symlinkIfMissing(targetDir, linkPath);
+    }
+  } else {
+    try {
+      const st = fs.lstatSync(chatConfigDir);
+      if (!st.isSymbolicLink() && st.isDirectory()) {
+        fs.rmSync(chatConfigDir, { recursive: true, force: true });
+      }
+    } catch {
+      // missing
+    }
+    if (fs.existsSync(profileConfigDir)) {
+      symlinkIfMissing(profileConfigDir, chatConfigDir);
     }
   }
 
@@ -548,7 +632,7 @@ export function buildAgyCommandSpec(params: {
 
   if (params.config.agyMode === 'mock') {
     const effectiveHome = !isProbeWorkspace
-      ? ensurePerChatHomeDir(params.profileDir, params.workspaceDir!)
+      ? ensurePerChatHomeDir(params.profileDir, params.workspaceDir!, params.config.builtinSkillsDir)
       : params.profileDir;
     const env = buildIsolatedAgyEnv({
       profileDir: params.profileDir,
@@ -577,6 +661,8 @@ export function buildAgyCommandSpec(params: {
     params.subcommandArgs[0] === 'acp'
       ? [...params.subcommandArgs, '--disable-telemetry']
       : params.subcommandArgs;
+
+  const docRuntime = resolveDocRuntimeLayout(params.config.docRuntimeDir);
 
   const wantsSandbox =
     Boolean(params.enableSandboxBwrap) &&
@@ -616,6 +702,29 @@ export function buildAgyCommandSpec(params: {
       '/etc/group',
     ];
 
+    try {
+      const fontCacheReal = fs.realpathSync('/var/cache/fontconfig');
+      if (fs.statSync(fontCacheReal).isDirectory()) {
+        bwrapArgs.push('--dir', '/var/cache', '--ro-bind', fontCacheReal, '/var/cache/fontconfig');
+      }
+    } catch {
+      // Ignore absent host fontconfig cache
+    }
+
+    let optDirMounted = false;
+    const ensureOptDir = () => {
+      if (!optDirMounted) {
+        bwrapArgs.push('--dir', '/opt');
+        optDirMounted = true;
+      }
+    };
+
+    if (docRuntime) {
+      ensureOptDir();
+      bwrapArgs.push('--ro-bind', docRuntime.hostDir, SANDBOX_DOC_RUNTIME_MOUNT);
+      applyDocRuntimeToEnv(env, SANDBOX_DOC_RUNTIME_MOUNT, docRuntime);
+    }
+
     const resolvedAgy = resolveCanonicalAgyBin(params.config.agyBin, env.PATH);
     let sandboxAgyCommand = resolvedAgy;
 
@@ -623,7 +732,8 @@ export function buildAgyCommandSpec(params: {
       if (isInsideSystemMountTree(resolvedAgy, mountedSystemDirs)) {
         sandboxAgyCommand = resolvedAgy;
       } else {
-        bwrapArgs.push('--dir', '/opt', '--dir', '/opt/agy', '--ro-bind', resolvedAgy, '/opt/agy/agy');
+        ensureOptDir();
+        bwrapArgs.push('--dir', '/opt/agy', '--ro-bind', resolvedAgy, '/opt/agy/agy');
         env.PATH = `/opt/agy:${env.PATH || '/usr/local/bin:/usr/bin:/bin'}`;
         sandboxAgyCommand = '/opt/agy/agy';
       }
@@ -705,6 +815,46 @@ export function buildAgyCommandSpec(params: {
       '--bind',
       chatPlaygroundHostDir,
       `${SANDBOX_HOME_MOUNT}/.gemini/playground`,
+      ...(() => {
+        const { active: activeBuiltins } = resolveActiveBuiltinSkillsForProfile(
+          profileAbs,
+          params.config.builtinSkillsDir
+        );
+        if (activeBuiltins.length === 0) return [];
+        const customSkillsDir = path.join(profileAbs, '.gemini', 'config', 'skills');
+        fs.mkdirSync(customSkillsDir, { recursive: true, mode: 0o700 });
+        const skillMounts: string[] = [
+          '--tmpfs',
+          `${SANDBOX_HOME_MOUNT}/.gemini/config/skills`,
+        ];
+        const customEntries = fs.readdirSync(customSkillsDir, { withFileTypes: true });
+        for (const entry of customEntries) {
+          if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+          if (!isValidSkillSlug(entry.name)) continue;
+          const candidate = path.join(customSkillsDir, entry.name);
+          if (fs.existsSync(path.join(candidate, LEGACY_BUILTIN_SYNC_MARKER))) continue;
+          if (!fs.existsSync(path.join(candidate, 'SKILL.md'))) continue;
+          let resolvedHostDir: string;
+          try {
+            resolvedHostDir = fs.realpathSync(candidate);
+          } catch {
+            continue;
+          }
+          skillMounts.push(
+            '--bind',
+            resolvedHostDir,
+            `${SANDBOX_HOME_MOUNT}/.gemini/config/skills/${entry.name}`
+          );
+        }
+        for (const builtin of activeBuiltins) {
+          skillMounts.push(
+            '--ro-bind',
+            builtin.dir,
+            `${SANDBOX_HOME_MOUNT}/.gemini/config/skills/${builtin.slug}`
+          );
+        }
+        return skillMounts;
+      })(),
       '--bind',
       workspaceAbs,
       SANDBOX_WORKSPACE_MOUNT,
@@ -725,7 +875,7 @@ export function buildAgyCommandSpec(params: {
   }
 
   const effectiveHome = params.workspaceDir
-    ? ensurePerChatHomeDir(params.profileDir, params.workspaceDir)
+    ? ensurePerChatHomeDir(params.profileDir, params.workspaceDir, params.config.builtinSkillsDir)
     : params.profileDir;
   const env = buildIsolatedAgyEnv({
     profileDir: params.profileDir,
@@ -738,6 +888,10 @@ export function buildAgyCommandSpec(params: {
       : undefined,
   });
 
+  if (docRuntime) {
+    applyDocRuntimeToEnv(env, docRuntime.hostDir, docRuntime);
+  }
+
   return {
     command: resolveCanonicalAgyBin(params.config.agyBin, env.PATH),
     args: agyArgs,
@@ -745,4 +899,100 @@ export function buildAgyCommandSpec(params: {
     sandboxed: false,
     sandboxWorkspaceRoot: workspaceFallback,
   };
+}
+
+interface DocRuntimeLayout {
+  hostDir: string;
+  venvBinRel: string | null;
+  nodeModulesRel: string | null;
+  nodeBinRel: string | null;
+  pythonSiteRels: string[];
+}
+
+function resolveDocRuntimeLayout(rawDir?: string | null): DocRuntimeLayout | null {
+  if (!rawDir || !rawDir.trim()) return null;
+  let hostDir: string;
+  try {
+    hostDir = fs.realpathSync(path.resolve(rawDir));
+    if (!fs.statSync(hostDir).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+
+  const hasDir = (rel: string): string | null => {
+    try {
+      const full = path.join(hostDir, rel);
+      return fs.statSync(full).isDirectory() ? rel : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const venvBinRel = hasDir(path.join('venv', 'bin'));
+  const nodeModulesRel = hasDir(path.join('node', 'node_modules')) ?? hasDir('node_modules');
+  const nodeBinRel =
+    hasDir(path.join('node', 'node_modules', '.bin')) ?? hasDir(path.join('node_modules', '.bin'));
+
+  const pythonSiteRels: string[] = [];
+  for (const libName of ['lib', 'lib64']) {
+    const libDir = path.join(hostDir, 'venv', libName);
+    try {
+      if (!fs.statSync(libDir).isDirectory()) continue;
+      for (const entry of fs.readdirSync(libDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !entry.name.startsWith('python')) continue;
+        const siteRel = path.join('venv', libName, entry.name, 'site-packages');
+        if (hasDir(siteRel)) {
+          pythonSiteRels.push(siteRel);
+        }
+      }
+    } catch {
+      // ignore missing python lib dir
+    }
+  }
+
+  if (!venvBinRel && !nodeModulesRel && pythonSiteRels.length === 0) {
+    return null;
+  }
+
+  return {
+    hostDir,
+    venvBinRel,
+    nodeModulesRel,
+    nodeBinRel,
+    pythonSiteRels,
+  };
+}
+
+function applyDocRuntimeToEnv(
+  env: NodeJS.ProcessEnv,
+  mountRoot: string,
+  layout: DocRuntimeLayout
+): void {
+  const pathPrefix: string[] = [];
+  if (layout.venvBinRel) {
+    pathPrefix.push(path.posix.join(mountRoot, layout.venvBinRel.split(path.sep).join(path.posix.sep)));
+  }
+  if (layout.nodeBinRel) {
+    pathPrefix.push(path.posix.join(mountRoot, layout.nodeBinRel.split(path.sep).join(path.posix.sep)));
+  }
+  if (pathPrefix.length > 0) {
+    env.PATH = `${pathPrefix.join(path.delimiter)}:${env.PATH || '/usr/local/bin:/usr/bin:/bin'}`;
+  }
+
+  if (layout.nodeModulesRel) {
+    const nm = path.posix.join(mountRoot, layout.nodeModulesRel.split(path.sep).join(path.posix.sep));
+    env.NODE_PATH = env.NODE_PATH ? `${nm}${path.delimiter}${env.NODE_PATH}` : nm;
+  }
+
+  if (layout.pythonSiteRels.length > 0) {
+    const sites = layout.pythonSiteRels.map((r) =>
+      path.posix.join(mountRoot, r.split(path.sep).join(path.posix.sep))
+    );
+    env.PYTHONPATH = env.PYTHONPATH
+      ? `${sites.join(path.delimiter)}${path.delimiter}${env.PYTHONPATH}`
+      : sites.join(path.delimiter);
+  }
+
+  env.PYTHONIOENCODING = 'utf-8';
+  env.SAL_USE_VCLPLUGIN = 'svp';
 }
