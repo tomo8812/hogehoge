@@ -566,7 +566,10 @@ export class SkillService {
 
     for (const legacyDir of roots.legacyEnabledDirs) {
       const candidate = path.join(legacyDir, slug);
-      if (fs.existsSync(path.join(candidate, 'SKILL.md'))) {
+      if (
+        fs.existsSync(path.join(candidate, 'SKILL.md')) &&
+        !(params.scope === 'global' && fs.existsSync(path.join(candidate, BUILTIN_SYNC_MARKER)))
+      ) {
         return {
           scope: params.scope,
           slug,
@@ -804,12 +807,6 @@ export class SkillService {
     migrateLegacySyncedBuiltins(profileDir);
   }
 
-  syncBuiltinSkillsToAllProfiles(): void {
-    for (const profileDir of this.db.listAgyProfileDirs()) {
-      this.syncBuiltinSkillsToProfile(profileDir);
-    }
-  }
-
   saveSkill(
     userId: string,
     input: {
@@ -842,7 +839,7 @@ export class SkillService {
     const existingLegacyDir =
       roots.legacyEnabledDirs
         .map((d) => path.join(d, slug))
-        .find((d) => fs.existsSync(path.join(d, 'SKILL.md'))) ?? null;
+        .find((d) => isCustomDir(d)) ?? null;
     const hasExistingCustom = existsEnabled || existsDisabled || Boolean(existingLegacyDir);
 
     if (input.scope === 'global' && !hasExistingCustom && builtinCatalog.has(slug)) {
